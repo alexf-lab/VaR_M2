@@ -1,0 +1,1681 @@
+---
+title: "Value at Risk sur l'action ORPEA.PA"
+author: "Alex FABRE"
+date: "13/10/2020"
+output:
+  bookdown::html_document2:
+    theme: paper
+    toc: yes
+    fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.align = "center",
+	fig.retina = 2,
+	fig.width = 10,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	cache.lazy = FALSE
+)
+```
+
+```{r packages,include=FALSE}
+library(QuantTools)
+library(xts)
+library(forecast)
+library(moments)
+library(BatchGetSymbols)
+library(TSA)
+library(lmtest)
+library(tseries)
+library(tigerstats)
+library(FinTS)
+library(fGarch)
+library(urca)
+library(CADFtest)
+library(knitr)
+library(doSNOW)
+library(parallel)
+library(foreach)
+library(kableExtra)
+```
+
+Résumé : (\@ref(tab:spoil))
+
+Ce projet est le premier d'une série de 2. Il s'agit dans celui-ci d'apprécier la spécification d'un modèle ARMA couplé à un modèle GARCH et de constater si la prise en compte d'un effet de levier est effective. Dans le prochain, nous développerons un modèle plus complexe (apARCH, eGARCH, iGARCH) afin d'établir la VaR et de réaliser le backtesting.
+
+# Données
+
+J'ai choisi l'action ORPEA car j'ai travaillé sur cette société l'année dernière dans un projet d'analyse financière. Je trouve intéréssant d'étudier à nouveau cette entreprise. C'est la deuxième plus grande société française dans le domaine de la santé des personnes agées. L'année dernière j'avais observé qu'Orpea avait une stratégie de long terme unique en investissant dans ses bâtiments. Sans rentrer dans les détails, Orpea a une stratégie financière assez robuste mais elle est sujette aux critiques. En effet, les conditions de vie proposées ne sont pas toujours de la qualité prétendue. J'avais donc conclut qu'investir dans Orpea est un investissement qui peut mener à une valorisation non négligeable mais sous couvert d'un risque grave de l'apparition d'une polémique.
+
+```{r données,}
+first.date <- "2009-12-31"
+last.date <- "2019-12-31"
+freq.data <- 'daily'
+type.return <- 'log'
+tickers <- 'ORP.PA'
+tab <- BatchGetSymbols(tickers = tickers, 
+                         first.date = first.date,
+                         last.date = last.date, 
+                         freq.data = freq.data,
+type.return=type.return,
+                         cache.folder = file.path(tempdir(), 
+                                                  'BGS_Cache') ) 
+     
+
+
+
+pt<-tab$df.tickers$price.adjusted
+dates<-tab$df.tickers$ref.date
+dpt=diff(pt)
+rt=tab$df.tickers$ret.adjusted.prices[-1]
+N<-length(rt)
+tab$df.tickers[1534,]
+rte=rt[1:1534]
+rtt=rt[1534:N]
+```
+  
+On a supprimé la première valeur de rt afin de ne pas avoir de valeurs manquantes.  
+On coupe vers les deux tiers notre série pour avoir une partie servant dans la détermination du Processus Générateur des Données (PGD). L'autre partie de la série nous servira plus tard pour le backtesting de la VaR. On s'occupera de ce fait des données allant du 1 janvier 2010 au 30 décembre 2015. Cet échantillon sera "rte" dans la suite.
+
+## Représentations graphiques des données
+
+```{r hist, fig.cap="Historique de l'action de 2010 à 2020"}
+op <- par(mfrow=c(3,1))
+plot(dates, pt, type='l',ylab="Indice ORP.PA" , xlab="Temps")
+plot(dates[2:length(dates)],dpt,type='l',col=2, ylab="Variations du cours ORPEA", xlab="Temps") #+ abline(h=0,col=3,lwd=1)
+plot(dates[2:length(dates)],rt,type='l',col=1,ylab = "Rendement du cours ORPEA", xlab="Temps")# + abline(h=0,col=3,lwd=0.5)
+```
+```{r include=FALSE}
+par(op)
+```
+On observe avec le premier chronogramme une tendance haussière dans la valorisation de l'indice sur l'ensemble de la période.  
+Le deuxième graphique indique que cette tendance n'est pas constante dans le temps. La variation de la valorisation boursière fluctue autour de 0 sur la période. Il y a une faible fluctation de 2010 à 2015, puis de plus fortes variations jusqu'à la fin de la période en 2020.  
+Pour terminer, on peut considérer qu'il y a plusieurs paquets de volatilité. Le premier fin 2011, le second en 2016 et un dernier en 2019. On peut se demander si la valorisation à la hausse comme à la baisse de l'indice se fait brusquement. Sur la période, le rendement logarithmique fluctue autour de 0. 
+
+
+# Tests statistiques
+
+Soit le test de student sur la nullité de la moyenne.
+
+\begin{equation}
+H_0 : E[rte] = 0 (\#eq:1)
+\end{equation}
+et l'hypothèse alternative, 
+\begin{equation}
+H_1 : E[rte] \ne 0 (\#eq:2)
+\end{equation}
+
+```{r}
+rbar <- mean(rte)
+s=sd(rte)
+t.test(rte)
+```
+
+La p-value est égale à 0.0531, ce qui est supérieur à 0.05. Nous sommes enclin à ne pas rejeter l'hypothèse nulle. La moyenne de notre série est statistiquement nulle pour un seuil de risque de 5%.
+
+```{r include=FALSE}
+h <- hist(rte,breaks=120)
+multiplier <- h$counts / h$density
+```
+
+
+```{r, fig.cap="Proportion des rendements logarithmiques"}
+plot(h, main= "", xlab="Rendements logarithmiques" , ylab = "Fréquences")
+myx <- seq(min(rte), max(rte), length.out= 500)
+normal <- dnorm(x = myx, mean =rbar, sd =s)
+lines(myx, normal * multiplier[1], col = "blue", lwd = 2)
+```
+
+La courbe bleu représente la densité d'une loi normale théorique. L'histogramme représente la fréquence des rendements logarithmiques.   
+On distingue une sur-représentation des valeurs extrêmes, comparativement à une loi normale.
+Visuellement on peut supposer deux choses. Premièrement la distribution semble leptokurtique. Deuxièmement l'occurence de rendements négatifs semble plus probable. Du fait de ce dernier point et que la moyenne soit statistiquement nulle, on peut supposer que les rendements positifs sont plus forts à défaut d'être plus fréquents.  
+Nous allons vérifier statistiquement ces deux suppositions.
+
+## Test sur la Skewness 
+
+On veut étudier si la distribution des rendements logarithmiques est symétrique.
+
+```{r}
+agostino.test(rte)
+```
+
+Le test d'Agostino consiste à regarder les moments centrés d'ordre 3 sur l'espérance $\mu_3 = E[(X-\mu)^3]$.  
+On réalise le test suivant :
+\begin{equation}
+H_0 : E[({X-E(X)\over\sigma_X})^3] = 0 (\#eq:SkewH0)
+\end{equation}
+et l'hypothèse alternative 
+\begin{equation}
+H_1 : E[({X-E(X)\over\sigma_X})^3] \not = 0 (\#eq:SkewH1)
+\end{equation}
+La p-value vaut 0.01541. Comme 0.01541 < 0.05, qui est notre seuil de significativité, le coefficient de skewness est significatif. Le skew est positif, égal à 0.11292.  
+On en déduit que la probabilité de pertes est plus grande que la probabilité de gains.
+
+## Test du Kurtosis 
+
+Il s'agit ici de vérifier si les queues de distribution sont plus épaisses que pour une loi normale.
+
+```{r}
+anscombe.test(rte)
+```
+
+Le test d'Anscombe se fait sur les moments centrés d'ordre 4 avec la variable suivante : $\mu_4 = E[(X-\mu)^4]$. Soit le test avec comme hypothèse principale 
+\begin{equation}
+H_0 : E[\lgroup{X-E(X)\over\sigma_X}\rgroup^4] = 3 (\#eq:KurtH0)
+\end{equation}
+et comme alternative 
+\begin{equation}
+H_1 : E[({X-E(X)\over\sigma_X})^4] \not= 3 (\#eq:KurtH1)
+\end{equation}
+La p-value (< 2.2e-16) est inférieure à 0.05 alors on rejette $H_0$ au seuil de 5%. Le kurtosis de la série vaut 5.4912. Il est supérieur à 3. Notre distribution est en effet leptokurtique. Les valeurs extrêmes sont sur-représentées en comparaison d'une loi normale centrée réduite.
+
+
+```{r, fig.cap="Représentation de l'auto-corrélation"}
+op<-par(mfrow=c(2,1))
+Acf(rte,main='ACF du rendement logarithmique')
+Acf(rte^2,main='ACF du rendement logarithmique au carré')
+```
+```{r include=FALSE}
+par(op)
+```
+
+Le premier graphique montre la présence d'autocorrélation des rendements à la période 4, 10 et 22.  
+Le second montre la présence d'autocorrélation pour les rendements au carrés jusqu'au 4ème lag, puis elle revient aux lags 8,13,16,21,22.
+
+## Test de Ljung-Box
+
+On effectue le test sous les hypothèses suivantes : 
+\begin{equation} 
+H_0 : \rho(k) =0, \ \forall k=1, ..., K (\#eq:LBH0)
+\end{equation}
+versus 
+\begin{equation}
+H_1 : \rho(k) \not= 0 \ pour \ au \ moins \ un \ k \ de \ 1 \ à \ K (\#eq:LBH1)
+\end{equation}
+La statistique du test de Ljung box est la suivante : 
+\begin{equation}
+Q_K=N(N+2)\sum_{k=1}^{K} \frac{\hat{\rho}(k)^2}{N-k} (\#eq:QLB)
+\end{equation}
+Donne sous $H_0$,
+\begin{equation}
+\forall k < K, \ Q_K \to _{N\to\infty}^L \chi^2(K) (\#eq:QLBH0)
+\end{equation}
+
+On effectue le test sur les rendements au carrés.
+
+```{r}
+pvaluesrte =rep(0,25)
+pvaluesrte2 =rep(0,25)
+for (i in 1:25 ) {
+pvaluesrte[i] = Box.test(rte,lag=i,type="Ljung-Box")$p.value
+pvaluesrte2[i] = Box.test(rte^2,lag=i,type="Ljung-Box")$p.value
+}
+pvaluesrte2
+```
+
+Toutes les p-values sont inférieures à 0.05 donc on rejette l'hypothèse nulle. Il y a présence d'autocorrélation dans les rendements logarithmiques au carrés.  
+  
+On effectue à nouveau le test mais sur les rendements.
+
+```{r}
+pvaluesrte
+```
+
+Toutes les p-values sont supérieures à 0.05. On ne rejette pas l'hypothèse nulle de présence d'autocorrélation. Les rendements logarithmiques ne sont pas auto-corrélés au seuil de 5%, ce qui est ce qu'on veut avoir. 
+
+# Saisonnalité
+
+Dans cette partie on se pose la question si le marché intègre des comportements dans la valorisation de l'actif suivant une période spécifique.
+
+## Effet Week-end
+
+Nous allons observer dans un premier temps les rendements quotidiens.
+
+```{r,}
+jour=format(dates[2:length(dates[1:1534])], format = "%A")
+tableaures <- data.frame(matrix(NA,ncol=5,nrow=4))
+colnames(tableaures) <- c("lundi","mardi","mercredi","jeudi","vendredi")
+rownames(tableaures) <- c("moyenne en %","écart-type annuel en %","skewness","kurtosis")
+rtemar<-as.numeric(rte[jour=="mardi"])
+mardi<-mean(rtemar) #moyenne journaliere
+tableaures[1,2] <- mardi*100 #moyenne journaliere en %
+tableaures[2,2] <- sd(rtemar)*100*sqrt(252) #ecart-type annualise en %
+tableaures[3,2] <- skewness(rtemar)
+tableaures[4,2] <- kurtosis(rtemar)
+rtemer<-as.numeric(rte[jour=="mercredi"])
+mer<-mean(rtemer)
+tableaures[1,3] <- mer*100
+tableaures[2,3] <- sd(rtemer)*100*sqrt(252)
+tableaures[3,3] <- skewness(rtemer)
+tableaures[4,3] <- kurtosis(rtemer)
+rtejeu<-as.numeric(rte[jour=="jeudi"])
+jeudi<-mean(rtejeu)
+tableaures[1,4] <- jeudi*100
+tableaures[2,4] <- sd(rtejeu)*100*sqrt(252)
+tableaures[3,4] <- skewness(rtejeu)
+tableaures[4,4] <- kurtosis(rtejeu)
+rteven<-as.numeric(rte[jour=="vendredi"])
+ven<-mean(rteven)
+tableaures[1,5] <- ven*100
+tableaures[2,5] <- sd(rteven)*100*sqrt(252)
+tableaures[3,5] <- skewness(rteven)
+tableaures[4,5] <- kurtosis(rteven)
+rtelun<-as.numeric(rte[jour=="lundi"])
+lundi<-mean(rtelun)
+tableaures[1,1] <- lundi*100
+tableaures[2,1] <- sd(rtelun)*100*sqrt(252)
+tableaures[3,1] <- skewness(rtelun)
+tableaures[4,1] <- kurtosis(rtelun)
+tableaures
+```
+  
+La moyenne du lundi varie de 0.11695% en moyenne. Ce jour est constitué plus fréquemment de rendements positifs (coefficient de skewness < 0). La distribution des rendements moyens a une queue plus épaisse qu'une loi normale (kurtosis > 3). Il y a une sur-représentation des valeurs extrêmes. Comme en moyenne les rendements sont positifs et qu'il y a majoritairement des rendements positifs. Les rendements négatifs lorsqu'ils occurent ne sont pas spécialement extrêmes.  
+On constate ce même effet le mercredi avec une moyenne de 0.17534% et un kurtosis > 3 mais avec un skewness positif donc fréquence plus haute de rendements négatifs. Le lundi et mercredi sont les jours où la moyenne des rendements est la plus haute.  
+Le mardi est le jour où l'écart type est le plus élevé. Ce point vient contredire French et Roll et Baillie et Bollerslev sur les effets "Lundi" ou "Mercredi". C'est même l'inverse de l'effet Mercredi puisqu'à partir de mardi l'écart type diminue plus on s'approche du week end. Là où eux prédisent un accroissement. Il y a majoritairement plus de rendements négatifs (coefficient de skewness > 0) et la distribution des rendements est plus aplatie qu'une loi normale (coefficient de kurtosis < 3).
+Les jeudi et vendredi sont notables par un kurtosis tout deux inférieur à 3. La distribution des rendements est comme pour mardi plus aplanie qu'une loi normale. Leur moyenne respective est tout comme mardi là aussi proche de 0. En revanche, le jeudi est composé de plus de rendement négatifs que positifs, le vendredi c'est l'inverse. Respectivement, coefficient de skewness positif et négatif.
+
+## Effet janvier
+
+```{r, fig.cap="Volatilité des rendements selon les mois de l'année"}
+monthplot(rte, ylab="rendement",main="", cex.main=1,col.base=2,lwd.base=3)
+```
+
+Ce graphique permet d'observer deux composantes pour juger de la volatilité, l'ampleur et la durée.  
+On a un double pic de rendements négatifs, le premier en février et le second en avril, pour une valeur de -0.06%. Le pic positif est atteint en septembre à environ 0.07%. On peut voir que le pic très bas de février est suivi d'un pic fortement positif (+0.05%) quelques jours plus tard. Les traits rouges représentent la moyenne mensuelle. On voit que le plus haut est en mai et le plus bas semble être en juillet. Acheter fin avril et vendre fin mai offre en moyenne un rendement positif. Le rendement moyen décroît de mai à juillet. Dans cette optique, il semble en moyenne rentable de vendre fin mai pour racheter fin juillet car en général le rendement moyen à diminué sur cette période de 2 mois.
+
+# Stationnarité 
+
+## Test de Dicky-Fuller
+
+J'ai testé deux premiers modèles avec une tendance et une constante. Je ne montre volontairement pas les processus et les résultats afin de ne pas surcharger inutilement, l'enjeu n'est pas dans ces tests.  
+
+Le test se fera sous les hypothèses suivantes : 
+\begin{equation}
+H_0 : \rho - 1 = 0   \ versus \ H_a : \rho < 1 (\#eq:DFH)
+\end{equation}
+Soit le modèle : 
+\begin{equation}
+\Delta rte_t = (\rho-1)rte_{t-1} + \epsilon_t (\#eq:DFeq)
+\end{equation}
+
+```{r}
+summary(ur.df(rte,type='none',lags=0))
+```
+
+On utilise un modèle de type "none" après avoir réfuté les modèles "trend" et "drift" car respectivement le coefficient associé à $\beta_1$ et $\beta_0$ n'est pas significatif. Conclusion tirée de la p-value supérieure à 0.05. Le processus ne pourra pas être TS. De surcroît, le t calculé vaut -39.5137. Or -39.5137 < -1.95 ($\tau_1$) donc on rejette H0, ce qui implique que le PGD n'est pas DS. 
+On en conclut que le PGD est stationnaire. Cette conclusion n'est valide que si les aléas de la régression ne sont pas auto-corrélés.
+
+```{r, fig.cap="Graphiques des résidus du test de Dickey-Fuller"}
+plot(ur.df(rte,lag=0,type='none'))
+```
+
+Dans le graphique de la PACF on constate que les aléas sont corrélés aux périodes 4 et 22, expliqué par le dépassement de la ligne bleue en pointillée. La conclusion tirée n'est pas valide. On va utiliser le test Dickey Fuller Augmenté, c'est à dire le même test en injectant des lags.
+
+## Dickey-Fuller Augmenté
+
+Le modèle utilisé n'est plus 'none' mais 'drift'. En effet, dans le test de DF nous avons rejeté le modèle drift suite à une p-value = 0.0515 (résultat volontairement non montré pour ne pas surcharger). Or, en incrémentant des lags le coefficient associé à $\beta_0$ est significatif (voir sortie R du test ADF qui suit) donc on utilisera le type 'drift' dorénavant.
+L'equation générale dans notre cas est la suivante :
+
+\begin{equation}
+\Delta rte_t = (\rho -1)rte_{t-1} + \beta_0 + \sum_{j=1}^{k} \gamma_j \Delta rte_{t-j} + \epsilon_t (\#eq:ADFeq)
+\end{equation}
+Sous les hypothèses : 
+\begin{equation}
+H_0 : \rho-1 = 0   \ versus \ H_a : \rho < 1 (\#eq:ADFH)
+\end{equation}
+Notre règle de décision dans la retenue du nombre de lags significatifs sera de garder gamma si la t-value associée, en valeur absolue, est supérieure à 1.6.
+
+### Critère MAIC
+
+Il nous faut définir en amont le critère de décision du nombre de lags retenus. Calculé suivant la formule de Schwert.  
+
+
+```{r}
+schwert <- as.integer(12*(length(rte)/100)^0.25)
+summary(CADFtest(rte,criterion="MAIC",type="drift",max.lag.y=schwert))
+```
+
+D'après le MAIC on retient un modèle avec aucun lag significatif. On a rejeté ce modèle auparavant. On utlisera par conséquent un autre critère.
+
+### Critère BIC
+
+```{r}
+summary(ur.df(rte,type='drift',selectlags = "BIC",lags=schwert))
+```
+
+En utilisant le critère BIC, le modèle obtenu est composé d'un lag. La t-value associée à ce lag vaut 0.695, elle est donc inférieure à 1,6. Le coefficient associé à ce lag n'est donc pas significatif. La statistique calculée vaut -28.227. La statistique simulée est $\tau_2 = -2.86$. Comme -28.14 < -2.86 le test ADF avec critère BIC permet de conclure à la stationarité du PGD qui a généré notre série de rendements. Je ne suis pas favorable à utiliser ce modèle avec un seul lag non significatif. Je vais alors utiliser un autre critère pour la partie principale du travail. Ce critère BIC servira en annexe pour le robustness check.
+On procède séquentiellement en diminuant la valeur de lags d'une unité en partant du critère de schwert.
+
+### Critère Schwert
+
+```{r}
+summary(ur.df(rte,type='drift',lags=schwert-2))
+```
+
+Le dernier lag significatif est le $21^{ième}$ car sa t-value est de 2.645, ce qui est supérieur en valeur absolue à 1.6. Les coefficients associés aux lags 1 à 9 et 21 sont significatifs.  
+On a $\tau\ calculé = -9.4302 < -2.86 = \tau\ simulé$, pour un risque de 5%. On rejette l'hypothèse nulle de présence de racine unitaire donc le PGD qui a généré la série des rendements logarithmiques est stationnaire. Ce qui donne l'equation suivante :
+
+\begin{equation}
+rte_t = 0.0008288\beta_0 -0.2939868rte_{t-1} + 0.2804015\Delta rte_{t-1} + 0.265878\Delta rte_{t-2} \\ + 0.2727357\Delta rte_{t-3} + 0.2156845\Delta rte_{t-4} + 0.1971725\Delta rte_{t-5} + 0.2297112\Delta rte_{t-6} \\ + 0.220878\Delta rte_{t-7} + 0.2158536\Delta rte_{t-8} + 0.1939194\Delta rte_{t-9} + 0.0686789\Delta rte_{t-21} (\#eq:ADFeqModele)
+\end{equation}
+
+## Zivot et Andrews
+
+Dans le cas avec un choc structurel et un choc conjoncturel on teste le modèle suivant :
+\begin{equation}
+rte_{t} = \beta_{0} + \beta_{1}t + \rho rte_{t-1} + \delta_{1}DU_{t}(\kappa) + \delta_{2}DT_{t}(\kappa) + \sum_{j=1}^{p} \gamma_{j}\Delta rte_{t-j} + \epsilon_{t} (\#eq:ZAeq)
+\end{equation}
+Sous 
+\begin{equation}
+H_{0} : 1 \ racine \ unitaire \ sans \ changement\ structurel\ exogène (\#eq:ZAH0)
+\end{equation}
+Contre
+\begin{equation}
+H_{a} : TS \ avec \ changement \ structurel \ à \ une \ date \ endogène (\#eq:ZAH1)
+\end{equation}
+
+
+```{r}
+summary(ur.za(rte, model='intercept', lag = schwert-2))
+```
+
+Dans une optique de ne pas surcharger inutilement le pdf j'ai testé sans laisser les résultats "model='both' et model='trend'". Ceux-ci n'étant pas concluants, j'ai procédé à l'eviction d'un potentiel choc structurel dans l'intercept. On retient ainsi un modèle avec un choc conjoncturel dans la tendance, représenté par "du".  
+Le dernier coefficient associé à un lag significatif est à la position 21, une nouvelle fois. Nous retenons ce modèle avec les coefficients associés aux lags 1 à 13, 17, 18 et 21 comme significatifs car leurs t-values sont supérieures en valeur absolue à 1,6.  
+Le tau calculé vaut -10.0052, le tau simulé pour un risque de 5% est -4.8. Comme -10.0052 < -4.8 nous n'acceptons pas $H_0$ la présence de racine unitaire sans changement structurel. Le choc potentiel intervient à la position 611, c'est à dire le 18 Mai 2012. Si l'on se rapporte à la figure (\@ref(fig:hist)) on peut voir une légère remontée de l'indice du prix, concernant les rendements on ne distingue pas volatilité spécialement forte. Je reviendrai sur ce point en illustrant avec le graphique de la statistique du test pour toutes les périodes.  
+Le dernier point à mentionner est la non significativité du coefficent associé à $\beta_1$. Défini dans la ligne "trend", sa p-value (0.26516) est supérieure au seuil de significativité de 5%. Le processus ne semble pas TS, nous sommes enclin à rejeter l'hypothèse alternative.
+
+```{r, fig.cap="Valeurs de la statistique de Zivot et Andrews à chaque période"}
+plot(ur.za(rte,model='intercept',lag=schwert-2))
+```
+
+Ce graphe est intéréssant car il montre que peu importe la date du choc nous sommes enclin à ne pas accepter $H_0$, même pour un risque de 1%. En effet, les droites horizontales représentent la valeur de la statistique simulée suivant le niveau de risque. Or, on constate que peu importe la période nous sommes loin de toucher la droite la plus restrictive du seuil de 1%. On peut supposer avoir une plus grande confiance dans la conclusion tirée, c'est à dire que notre série est stationnaire. L'équation obtenue est ici encore barbare, elle est la suivante :
+
+\begin{equation}
+rte_t = -0.4431rte_{t-1} + 0.003397DU_t(\kappa) + 0.4227\Delta rte_{t-1} + 0.4012\Delta rte_{t-2} + 0.4012\Delta rte_{t-3} + 0.3374\Delta rte_{t-4}\\ + 0.3119\Delta rte_{t-5}  + 0.3372\Delta rte_{t-6} + 0.3211\Delta rte_{t-7} + 3.089\Delta rte_{t-8} + 0.2802\Delta rte_{t-9} + 0.224\Delta rte_{t-10} \\ + 0.1834\Delta rte_{t-11} + 0.1876\Delta rte_{t-12} + 0.1614\Delta rte_{t-13} + 0.1071\Delta rte_{t-17} + 0.1006\Delta rte_{t-18} + 0.07461\Delta rte_{t-21} (\#eq:ZAeqModele)
+\end{equation}
+
+## Lee et Strazicich
+
+```{r Package LS, include=FALSE}
+# Package LS
+ur.ls <- function(y, model = c("crash", "break"), breaks = 1, lags = NULL, method = c("GTOS","Fixed"), pn = 0.1, print.results = c("print", "silent")){
+  #Starttime
+  starttime <- Sys.time()
+  
+  #Check sanity of the function call
+  if (any(is.na(y))) 
+    stop("\nNAs in y.\n")
+  y <- as.vector(y)
+  
+  if(pn >= 1 || pn <= 0){
+    stop("\n pn has to be between 0 and 1.")
+  }
+  if(method == "Fixed" && is.null(lags) == TRUE){
+    stop("\n If fixed lag length should be estimated, the number 
+         \n of lags to be included should be defined explicitely.")
+  }
+  
+  #Add lagmatrix function
+  lagmatrix <- function(x,max.lag){
+    embed(c(rep(NA,max.lag),x),max.lag+1)
+  }
+  #Add diffmatrix function
+  diffmatrix <- function(x,max.diff,max.lag){
+    #Add if condition to make it possible to differentiate between matrix and vector                  
+    if(is.vector(x) == TRUE ){
+      embed(c(rep(NA,max.lag),diff(x,max.lag,max.diff)),max.diff)
+    }
+    
+    else if(is.matrix(x) == TRUE){
+      rbind(matrix(rep(NA,max.lag), ncol = ncol(x)), matrix(diff(x,max.lag,max.diff), ncol = ncol(x)))
+    }
+    #if matrix the result should be 0, if only a vector it should be 1
+    else if(as.integer(is.null(ncol(x))) == 0 ){
+      rbind(matrix(rep(NA,max.lag), ncol = ncol(x)), matrix(diff(x,max.lag,max.diff), ncol = ncol(x)))
+      
+    }
+  }
+  
+  #Number of observations
+  n <- length(y)
+  model <- match.arg(model)
+  lags <- as.integer(lags)
+  method <- match.arg(method)
+  breaks <- as.integer(breaks)
+  #Percentage to eliminate endpoints in the lag calculation
+  pn <- pn
+  #Critical Values for the one break test
+  model.one.crash.cval <- matrix(c(-4.239, -3.566, -3.211)
+                                 , nrow = 1, ncol = 3, byrow = TRUE)
+  
+  colnames(model.one.crash.cval) <- c("1%","5%","10%")
+  model.one.break.cval <- matrix(c(.1 , -5.11, -4.5, -4.21,
+                                   .2 , -5.07, -4.47, -4.20,
+                                   .3 , -5.15, -4.45, -4.18,
+                                   .4 , -5.05, -4.50, -4.18,
+                                   .5 , -5.11, -4.51, -4.17), nrow = 5, ncol = 4, byrow = TRUE)
+  colnames(model.one.break.cval) <- c("lambda","1%","5%","10%")
+ 
+
+  model.two.crash.cval <- matrix(c("LM_tau", -4.545, -3.842, -3.504,
+                                   "LM_rho", -35.726, -26.894, -22.892), nrow = 2, ncol = 4, byrow = TRUE ) 
+  
+  colnames(model.two.crash.cval) <-  c("Statistic","1%","5%","10%")
+  
+  
+  # Model C (i) - "break" model, breaks in the data generating process
+  # Model C (i) - "break" model invariant to the location of the crash
+  
+  model.two.break.dgp.cval <- matrix(c("LM_tau", -5.823, -5.286, -4.989,
+                                       "LM_rho", -52.550, -45.531, -41.663), nrow = 2, ncol = 4, byrow = TRUE ) 
+  
+  
+  # Model C (ii) - "break" model, breaks are not considered in the data generating process
+  # Model C (ii) - "break" model depends on the location of the crash
+  ## highest level of list is the location of the second breakpoint - so the share inside 
+  ## the matrix refers to the first breakpoint
+  model.two.break.tau.cval <-  matrix(c( -6.16, -5.59, -5.27, -6.41, -5.74, -5.32, -6.33, -5.71, -5.33,
+                                         NA    ,   NA,  NA  , -6.45, -5.67, -5.31, -6.42, -5.65, -5.32,
+                                         NA    ,   NA,  NA  , NA   , NA   , NA   , -6.32, -5.73, -5.32)
+                                      , nrow = 3, ncol = 9, byrow = TRUE )
+  
+  rownames(model.two.break.tau.cval) <- c("Break 1 - 0.2", "Break 1 - 0.4", "Break 1 - 0.6")
+  colnames(model.two.break.tau.cval) <- c("Break 2 - 0.4 - 1%", "Break 2 - 0.4 - 5%", "Break 2 - 0.4 - 10%",
+                                          "Break 2 - 0.6 - 1%", "Break 2 - 0.6 - 5%", "Break 2 - 0.6 - 10%",
+                                          "Break 2 - 0.8 - 1%", "Break 2 - 0.8 - 5%", "Break 2 - 0.8 - 10%")
+  
+  
+  model.two.break.rho.cval <-  matrix(c( -55.4 , -47.9, -44.0, -58.6, -49.9, -44.4, -57.6, -49.6, -44.6,
+                                         NA    ,    NA,  NA  ,-59.3, -49.0, -44.3, -58.8, -48.7, -44.5,
+                                         NA    ,    NA,  NA  , NA  , NA   , NA    ,-57.4, -49.8, -44.4)
+                                      , nrow = 3, ncol = 9, byrow = TRUE )
+  
+  
+  rownames(model.two.break.rho.cval) <- c("Break 1 - 0.2", "Break 1 - 0.4", "Break 1 - 0.6")
+  colnames(model.two.break.rho.cval) <- c("Break 2 - 0.4 - 1%", "Break 2 - 0.4 - 5%", "Break 2 - 0.4 - 10%",
+                                          "Break 2 - 0.6 - 1%", "Break 2 - 0.6 - 5%", "Break 2 - 0.6 - 10%",
+                                          "Break 2 - 0.8 - 1%", "Break 2 - 0.8 - 5%", "Break 2 - 0.8 - 10%")
+  #Number of observations to eliminate in relation to the sample length
+  pnnobs <- round(pn*n)
+  
+  
+  #Define the start values
+  startl <- 0
+  myBreakStart <- startl + 1 + pnnobs
+  myBreakEnd <- n - pnnobs
+  
+  #Calculate Dy
+  y.diff <- diffmatrix(y, max.diff = 1, max.lag = 1)
+  
+  #Calculation
+  #trend for 1:n like in ur.sp 
+  trend <- 1:n
+  
+  #Define minimum gap between the two possible break dates.
+  #the gap is 2 in the crash case and 3 periods in the case of a break model
+  gap <- 2 + as.numeric(model == "break")
+  
+  
+  myBreaks <- matrix(NA, nrow = n - 2 * pnnobs, ncol =  breaks)
+  if(breaks == 1){
+    myBreaks [,1] <- myBreakStart:myBreakEnd
+  } else if (breaks == 2){
+    myBreaks[, 1:breaks] <- cbind(myBreakStart:myBreakEnd,(myBreakStart:myBreakEnd)+gap)
+  }
+  #Define the variables to hold the minimum t-stat
+  tstat <- NA
+  mint <- 1000
+  tstat.matrix <- matrix(NA, nrow = n, ncol = n )
+  tstat.result <- matrix()
+  #Create lists to store the results
+  #Lists for the one break case
+  result.reg.coef <- list()
+  result.reg.resid <- list()
+  result.matrix <- list()
+  
+  #Function to analyze the optimal lags to remove autocorrelation from the residuals
+  #Lag selection with general to specific procedure based on Ng,Perron (1995)
+  myLagSelection <- function(y.diff, S.tilde, datmat, pmax, Dummy.diff){
+    n <- length(y.diff)
+    
+    #               General to specific approach to determine the lag which removes autocorrelation from the residuals
+    #               Ng, Perron 1995
+    qlag <- pmax
+    while (qlag >= 0) {
+      
+      #               Define optimal lags to include to remove autocorrelation from the residuals
+      #               select p.value of the highest lag order and check if significant
+      #test.coef <- coef(summary(lm(y.diff ~ 0 + lagmatrix(S.tilde,1)[,-1] + datmat[,-1][, 1:(qlag + 1)]  + Dummy.diff)))
+      
+      #lm.fit implementation
+      test.reg.data <- na.omit(cbind(y.diff,lagmatrix(S.tilde,1)[,-1], datmat[,-1][, 1:(qlag + 1)], Dummy.diff))
+      
+      test.reg.lm. <-(lm.fit(x = test.reg.data[,-1], y = test.reg.data[, 1]))
+      
+      df.lm.fit <- length(test.reg.data[,1]) - test.reg.lm.$qr$rank
+      sigma2 <- sum((test.reg.data[,1] - test.reg.lm.$fitted.values)^2)/df.lm.fit
+      varbeta <- sigma2 * chol2inv(qr.R(test.reg.lm.$qr), size = ncol(test.reg.data) -2)
+      SE <- sqrt(diag(varbeta))
+      tstat <- na.omit(coef(test.reg.lm.))/SE
+      pvalue <- 2* pt(abs(tstat), df = df.lm.fit, lower.tail =  FALSE)
+      
+      #                print(test.coef)
+      #                print(paste("lm result:",qlag,test.coef[qlag + 1 , 4]))
+      #                print(paste("lm.fit:",qlag,pvalue[qlag+1]))
+      #               print(c("Number of qlag",qlag)) 
+      if(pvalue[qlag+1] <= 0.1){
+        slag <- qlag
+        #                  print("break")
+        break
+      }
+      qlag <- qlag - 1
+      slag <- qlag
+      
+    }
+    #            print(slag)
+    return(slag)
+  }
+  
+  # Function to calculate the test statistic and make the code shorter, because the function can be used in both cases for 
+  # the one break as well as the two break case
+  myLSfunc <- function(Dt, DTt, y.diff, est.function = c("estimation","results")){
+    
+    Dt.diff <- diffmatrix(Dt, max.diff = 1, max.lag = 1)
+    
+    DTt.diff <- diffmatrix(DTt, max.diff = 1, max.lag = 1)
+    
+    S.tilde <- 0
+    S.tilde <- c(0, cumsum(lm.fit(x = na.omit(cbind(Dt.diff[,])), y=na.omit(y.diff))$residuals))
+    S.tilde.diff <-  diffmatrix(S.tilde,max.diff = 1, max.lag = 1)
+    #       Define optimal lags to include to remove autocorrelation
+    #       max lag length pmax to include is based on Schwert (1989) 
+    pmax <- min(round((12*(n/100)^0.25)),lags)
+    
+    #      Create matrix of lagged values of S.tilde.diff from 0 to pmax
+    #      and check if there is autocorrelation if all these lags are included and iterate down to 1          
+    datmat <- matrix(NA,n, pmax + 2)
+    datmat[ , 1] <- S.tilde.diff
+    #      Add column of 0 to allow the easy inclusion of no lags into the test estimation
+    datmat[ , 2] <- rep(0, n)
+    
+    if(pmax > 0){
+      datmat[, 3:(pmax + 2) ] <- lagmatrix(S.tilde.diff, pmax)[,-1]
+      colnames(datmat) <- c("S.tilde.diff", "NoLags",  paste("S.tilde.diff.l",1:pmax, sep = ""))
+    } else if(lags == 0){
+      colnames(datmat) <- c("S.tilde.diff", "NoLags")
+    }
+    
+    
+    if(method == "Fixed"){
+      slag <- lags
+    } else if(method == "GTOS"){
+      
+      slag <- NA
+      
+      if(model == "crash"){
+        slag <- myLagSelection(y.diff, S.tilde, datmat, pmax, Dt.diff)
+        
+      } else if(model == "break"){
+        slag <- myLagSelection(y.diff, S.tilde, datmat, pmax, DTt.diff)
+      }
+    }
+    
+    S.tilde <- NA
+    
+    
+    
+    if(model == "crash"){
+      S.tilde <- c(0, cumsum(lm.fit(x = na.omit(cbind(Dt.diff[,])), y=na.omit(y.diff))$residuals))
+      S.tilde.diff <-  diffmatrix(S.tilde, max.diff = 1, max.lag = 1)
+      
+      #Add lag of S.tilde.diff to control for autocorrelation in the residuals
+      if(est.function == "results"){
+        break.reg <- summary(lm(y.diff ~ 0 + lagmatrix(S.tilde, 1)[,-1] + datmat[,2:(slag+2)]  + Dt.diff))
+      } else if (est.function == "estimation"){
+        #lm.fit() implementation
+        roll.reg.data <- na.omit(cbind(y.diff, lagmatrix(S.tilde,1)[,-1], datmat[,2:(slag+2)], Dt.diff))
+        
+        roll.reg.lm. <- lm.fit(x = roll.reg.data[,-1], y = roll.reg.data[, 1])
+        
+        
+        df.lm.fit <- length(roll.reg.data[, 1]) - roll.reg.lm.$qr$rank
+        sigma2 <- sum((roll.reg.data[, 1] - roll.reg.lm.$fitted.values)^2)/df.lm.fit
+        varbeta <- sigma2*chol2inv(qr.R(roll.reg.lm.$qr), size = ncol(roll.reg.data) - 2)
+        SE <- sqrt(diag(varbeta))
+        tstat.lm.fit <- na.omit(coef(roll.reg.lm.))/SE
+        pvalue <- 2 * pt(abs(tstat.lm.fit),df = df.lm.fit, lower.tail =  FALSE)
+        coef.roll.reg.lm <- cbind(na.omit(coef(roll.reg.lm.)), SE, tstat.lm.fit, pvalue)
+        
+        tstat.lm.fit <- tstat.lm.fit[1] 
+        
+        # tstat.lm <- coef(break.reg)[1,3]
+        return(coef.roll.reg.lm)
+      }
+      
+      # print(paste("lm.fit", tstat.lm.fit[1]))
+      # print(paste("lm", tstat.lm))
+      #print(roll.reg)
+      if(est.function == "estimation"){
+        return(coef.roll.reg.lm)
+      } else if(est.function == "results"){
+        return(break.reg)
+      }
+      
+    } else if(model =="break"){
+      S.tilde <- c(0, cumsum(lm.fit(x = na.omit(cbind(DTt.diff[,])), y=na.omit(y.diff))$residuals))
+      S.tilde.diff <-  diffmatrix(S.tilde, max.diff = 1, max.lag = 1)
+      
+      
+      #Add lag of S.tilde.diff to control for autocorrelation in the residuals
+      if(est.function == "results"){
+        break.reg <- summary(lm(y.diff ~ 0 + lagmatrix(S.tilde,1)[,-1] + datmat[,2:(slag+2)] + DTt.diff))
+      } else if (est.function == "estimation"){
+        #lm.fit() implementation
+        roll.reg.data <- na.omit(cbind(y.diff, lagmatrix(S.tilde,1)[,-1], datmat[,2:(slag+2)], DTt.diff))
+        
+        roll.reg.lm. <- lm.fit(x = roll.reg.data[,-1], y = roll.reg.data[, 1])
+        
+        df.lm.fit <- length(roll.reg.data[, 1]) - roll.reg.lm.$qr$rank
+        sigma2 <- sum((roll.reg.data[, 1] - roll.reg.lm.$fitted.values)^2)/df.lm.fit
+        varbeta <- sigma2*chol2inv(qr.R(roll.reg.lm.$qr), size = ncol(roll.reg.data) -2)
+        SE <- sqrt(diag(varbeta))
+        tstat.lm.fit <- na.omit(coef(roll.reg.lm.))/SE
+        pvalue <- 2 * pt(abs(tstat.lm.fit),df = df.lm.fit, lower.tail =  FALSE)
+        coef.roll.reg.lm <- cbind(na.omit(coef(roll.reg.lm.)), SE, tstat.lm.fit, pvalue)
+        
+        tstat.lm.fit <- tstat.lm.fit[1] 
+        return(coef.roll.reg.lm)
+        # tstat.lm <- coef(break.reg)[1,3]
+      }
+      #Return Value
+      #print(roll.reg)
+      #print(paste("lm.fit", tstat.lm.fit))
+      #print(paste("lm", tstat.lm))
+      #print("break")
+      if(est.function == "estimation"){
+        return(coef.roll.reg.lm)
+      } else if(est.function == "results"){
+        return(break.reg)
+      }
+      
+    }
+    
+    #   print(roll.reg)
+    if(est.function == "estimation"){
+      return(coef.roll.reg.lm)
+    } else if(est.function == "results"){
+      return(break.reg)
+    }
+    
+  }
+  
+  
+  # Start of the actual function call
+  
+  if(breaks == 1)
+  {
+    # Function to calculate the rolling t-stat
+    # One Break Case
+    for(myBreak1 in myBreaks[,1]){
+      #Dummies for one break case
+      Dt1 <-  as.matrix(cbind(trend, trend >= (myBreak1 + 1)))
+      
+      #       Dummy with break in intercept and in trend
+      DTt1 <- as.matrix(cbind(Dt1, c(rep(0, myBreak1), 1:(n - myBreak1))))
+      colnames(Dt1) <- c("Trend","D")
+      colnames(DTt1) <- c("Trend","D","DTt")
+      #print(paste("Break1: ",myBreak1, sep = ""))
+      
+      #Combine all Dummies into one big matrix to make it easier to include in the regressions
+      
+      Dt <- cbind(Dt1)
+      DTt <- cbind(DTt1)
+      
+      result.reg <- myLSfunc(Dt, DTt, y.diff, est.function = c("estimation"))
+      
+      
+      
+      #Extract the t-statistic and if it is smaller than all previous 
+      #t-statistics replace it and store the values of all break variables
+      #Extract residuals and coefficients and store them in a list
+      
+      #result.matrix[[myBreak1]] <- result.reg
+      #result.reg.coef[[myBreak1]] <- coefficients(result.reg)
+      
+      
+      tstat <- result.reg[1,3]
+      tstat.result[myBreak1] <- result.reg[1,3]
+      #print(tstat)
+      if(tstat < mint){
+        mint <- tstat
+        mybestbreak1 <- myBreak1
+      }
+      
+      
+    }#End of first for loop
+    
+  } else if(breaks == 2) {
+    
+    
+    ## Two Break Case
+    #First for loop for the two break case
+    for(myBreak1 in myBreaks[,1]){
+      #Dummies for one break case
+      Dt1 <-  as.matrix(cbind(trend, trend >= (myBreak1 + 1)))
+      
+      #       Dummy with break in intercept and in trend
+      DTt1 <- as.matrix(cbind(Dt1, c(rep(0, myBreak1), 1:(n - myBreak1))))
+      colnames(Dt1) <- c("Trend","D")
+      colnames(DTt1) <- c("Trend","D","DTt")
+      #print(paste("Break1: ",myBreak1, sep = ""))
+      
+      #Second for loop for the two break case
+      for(myBreak2 in  myBreaks[which(myBreaks[,2] < myBreakEnd & myBreaks[,2] >= myBreak1 + gap),2]){
+        
+        #Dummies for two break case
+        Dt2 <-  as.matrix(trend >= (myBreak2 + 1))
+        DTt2 <- as.matrix(cbind(Dt2, c(rep(0, myBreak2), 1:(n - myBreak2))))
+        colnames(Dt2) <- c("D2")
+        colnames(DTt2) <- c("D2","DTt2")
+        #print(paste("Break2: ",myBreak2, sep = ""))
+        
+        #Combine all Dummies into one big matrix to make it easier to include in the regressions
+        
+        Dt <- cbind(Dt1, Dt2)
+        DTt <- cbind(DTt1, DTt2)
+        
+        result.reg <- myLSfunc(Dt, DTt, y.diff, est.function = c("estimation"))
+        
+        #Extract the t-statistic and if it is smaller than all previous 
+        #t-statistics replace it and store the values of all break variables
+        #Extract residuals and coefficients and store them in a list
+        
+        
+        #matrix to hold all the tstats
+        tstat.matrix[myBreak1, myBreak2] <- result.reg[1,3]
+        tstat <- result.reg[1,3]
+        
+        #print(tstat)
+        if(tstat < mint){
+          mint <- tstat
+          mybestbreak1 <- myBreak1
+          mybestbreak2 <- myBreak2
+        }
+        
+      }#End of second for loop
+    }#End of first for loop
+  } else if(breaks > 2){
+    
+    print("Currently more than two possible structural breaks are not implemented.")
+  }
+  
+  #Estimate regression results, based on the determined breaks and the selected lag 
+  # to obtain all necessary information
+  Dt1 <-  as.matrix(cbind(trend, trend >= (mybestbreak1 + 1)))
+  
+  #       Dummy with break in intercept and in trend
+  DTt1 <- as.matrix(cbind(Dt1, c(rep(0, mybestbreak1), 1:(n - mybestbreak1))))
+  colnames(Dt1) <- c("Trend","D")
+  colnames(DTt1) <- c("Trend","D","DTt")
+  #print(paste("Break1: ",myBreak1, sep = ""))
+  
+  if(breaks == 2){
+    #Dummies for two break case
+    Dt2 <-  as.matrix(trend >= (mybestbreak2 + 1))
+    DTt2 <- as.matrix(cbind(Dt2, c(rep(0, mybestbreak2), 1:(n - mybestbreak2))))
+    colnames(Dt2) <- c("D2")
+    colnames(DTt2) <- c("D2","DTt2")
+    #print(paste("Break2: ",myBreak2, sep = ""))
+    
+    #Combine all Dummies into one big matrix to make it easier to include in the regressions
+    
+    Dt <- cbind(Dt1, Dt2)
+    DTt <- cbind(DTt1, DTt2)
+  } else if (breaks == 1){
+    Dt <- Dt1
+    DTt <- DTt1
+    
+  }
+  
+  
+  break.reg <- myLSfunc(Dt, DTt, y.diff, est.function = c("results")) 
+  
+  endtime <- Sys.time()
+  myruntime <- difftime(endtime,starttime, units = "mins")
+  if(print.results == "print"){
+  print(mint)
+  print(paste("First possible structural break at position:", mybestbreak1))
+  print(paste("The location of the first break - lambda_1:", round(mybestbreak1/n, digits = 1),", with the number of total observations:", n))  
+  if(breaks == 2){
+    print(paste("Second possible structural break at position:", mybestbreak2))
+    print(paste("The location of the second break - lambda_2:", round(mybestbreak2/n, digits = 1),", with the number of total observations:", n))  
+    
+    
+    # Output Critical Values    
+    cat("Critical values:\n")
+    print(model.two.break.tau.cval)
+    
+  }else if(breaks == 1){
+    if(model == "crash"){
+      cat("Critical values - Crash model:\n")
+      print(model.one.crash.cval)
+    } else if(model == "break"){
+      cat("Critical values - Break model:\n")
+      print(model.one.break.cval)
+    }
+    
+  }
+  
+  if(method == "Fixed"){
+    print(paste("Number of lags used:",lags))
+  } else if(method == "GTOS"){
+    print(paste("Number of lags determined by general-to-specific lag selection:" 
+                ,as.integer(substring(unlist(attr(delete.response(terms(break.reg)), "dataClasses")[3]),9))-1))
+  } 
+  cat("Runtime:\n")
+  print(myruntime)
+  }
+  # Create complete list with all the information and not only print it
+  if(breaks == 2){
+    results.return <- list(mint, mybestbreak1, mybestbreak2, myruntime)
+    names(results.return) <- c("t-stat", "First break", "Second break", "Runtime")
+  } else if(breaks == 1){
+    results.return <- list(mint, mybestbreak1, myruntime)
+    names(results.return) <- c("t-stat", "First break", "Runtime")
+  }
+  
+  return(list(results.return, break.reg))
+  }#End of ur.ls function
+
+#Additional option for the calculation of the critical value is available, but not used at the moment
+ur.ls.bootstrap <- function(y, model = c("crash", "break"), breaks = 1, lags = NULL, method = c("GTOS","Fixed"), pn = 0.1, critval = c("bootstrap","theoretical"), print.results = c("print", "silent")){
+  #Starttime
+  starttime <- Sys.time()
+  
+  #Check sanity of the function call
+  if (any(is.na(y))) 
+    stop("\nNAs in y.\n")
+  y <- as.vector(y)
+  
+  if(pn >= 1 || pn <= 0){
+    stop("\n pn has to be between 0 and 1.")
+  }
+  if(method == "Fixed" && is.null(lags) == TRUE){
+    stop("\n If fixed lag length should be estimated, the number 
+         \n of lags to be included should be defined explicitely.")
+  }
+  
+  #Add lagmatrix function
+  lagmatrix <- function(x,max.lag){
+    embed(c(rep(NA,max.lag),x),max.lag+1)
+  }
+  #Add diffmatrix function
+  diffmatrix <- function(x,max.diff,max.lag){
+    #Add if condition to make it possible to differentiate between matrix and vector                  
+    if(is.vector(x) == TRUE ){
+      embed(c(rep(NA,max.lag),diff(x,max.lag,max.diff)),max.diff)
+    }
+    
+    else if(is.matrix(x) == TRUE){
+      rbind(matrix(rep(NA,max.lag), ncol = ncol(x)), matrix(diff(x,max.lag,max.diff), ncol = ncol(x)))
+    }
+    #if matrix the result should be 0, if only a vector it should be 1
+    else if(as.integer(is.null(ncol(x))) == 0 ){
+      rbind(matrix(rep(NA,max.lag), ncol = ncol(x)), matrix(diff(x,max.lag,max.diff), ncol = ncol(x)))
+      
+    }
+  }
+  
+  #Number of observations
+  n <- length(y)
+  model <- match.arg(model)
+  lags <- as.integer(lags)
+  method <- match.arg(method)
+  breaks <- as.integer(breaks)
+  #Percentage to eliminate endpoints in the lag calculation
+  pn <- pn
+  #Critical Values for the one break test
+  model.one.crash.cval <- matrix(c(-4.239, -3.566, -3.211)
+                                 , nrow = 1, ncol = 3, byrow = TRUE)
+  
+  colnames(model.one.crash.cval) <- c("1%","5%","10%")
+  model.one.break.cval <- matrix(c(.1 , -5.11, -4.5, -4.21,
+                                   .2 , -5.07, -4.47, -4.20,
+                                   .3 , -5.15, -4.45, -4.18,
+                                   .4 , -5.05, -4.50, -4.18,
+                                   .5 , -5.11, -4.51, -4.17), nrow = 5, ncol = 4, byrow = TRUE)
+  colnames(model.one.break.cval) <- c("lambda","1%","5%","10%")
+ 
+  model.two.crash.cval <- matrix(c("LM_tau", -4.545, -3.842, -3.504,
+                                   "LM_rho", -35.726, -26.894, -22.892), nrow = 2, ncol = 4, byrow = TRUE ) 
+  
+  colnames(model.two.crash.cval) <-  c("Statistic","1%","5%","10%")
+  
+  
+  # Model C (i) - "break" model, breaks in the data generating process
+  # Model C (i) - "break" model invariant to the location of the crash
+  
+  model.two.break.dgp.cval <- matrix(c("LM_tau", -5.823, -5.286, -4.989,
+                                       "LM_rho", -52.550, -45.531, -41.663), nrow = 2, ncol = 4, byrow = TRUE ) 
+  
+  
+  # Model C (ii) - "break" model, breaks are not considered in the data generating process
+  # Model C (ii) - "break" model depends on the location of the crash
+  ## highest level of list is the location of the second breakpoint - so the share inside 
+  ## the matrix refers to the first breakpoint
+  model.two.break.tau.cval <-  matrix(c( -6.16, -5.59, -5.27, -6.41, -5.74, -5.32, -6.33, -5.71, -5.33,
+                                         NA    ,   NA,  NA  , -6.45, -5.67, -5.31, -6.42, -5.65, -5.32,
+                                         NA    ,   NA,  NA  , NA   , NA   , NA   , -6.32, -5.73, -5.32)
+                                      , nrow = 3, ncol = 9, byrow = TRUE )
+  
+  rownames(model.two.break.tau.cval) <- c("Break 1 - 0.2", "Break 1 - 0.4", "Break 1 - 0.6")
+  colnames(model.two.break.tau.cval) <- c("Break 2 - 0.4 - 1%", "Break 2 - 0.4 - 5%", "Break 2 - 0.4 - 10%",
+                                          "Break 2 - 0.6 - 1%", "Break 2 - 0.6 - 5%", "Break 2 - 0.6 - 10%",
+                                          "Break 2 - 0.8 - 1%", "Break 2 - 0.8 - 5%", "Break 2 - 0.8 - 10%")
+  
+  
+  model.two.break.rho.cval <-  matrix(c( -55.4 , -47.9, -44.0, -58.6, -49.9, -44.4, -57.6, -49.6, -44.6,
+                                         NA    ,    NA,  NA  ,-59.3, -49.0, -44.3, -58.8, -48.7, -44.5,
+                                         NA    ,    NA,  NA  , NA  , NA   , NA    ,-57.4, -49.8, -44.4)
+                                      , nrow = 3, ncol = 9, byrow = TRUE )
+  
+  
+  rownames(model.two.break.rho.cval) <- c("Break 1 - 0.2", "Break 1 - 0.4", "Break 1 - 0.6")
+  colnames(model.two.break.rho.cval) <- c("Break 2 - 0.4 - 1%", "Break 2 - 0.4 - 5%", "Break 2 - 0.4 - 10%",
+                                          "Break 2 - 0.6 - 1%", "Break 2 - 0.6 - 5%", "Break 2 - 0.6 - 10%",
+                                          "Break 2 - 0.8 - 1%", "Break 2 - 0.8 - 5%", "Break 2 - 0.8 - 10%")
+  #Number of observations to eliminate in relation to the sample length
+  pnnobs <- round(pn*n)
+  
+  
+  #Define the start values
+  startl <- 0
+  myBreakStart <- startl + 1 + pnnobs
+  myBreakEnd <- n - pnnobs
+  
+  #Calculate Dy
+  y.diff <- diffmatrix(y, max.diff = 1, max.lag = 1)
+  
+  #Calculation
+  #trend for 1:n like in ur.sp 
+  trend <- 1:n
+  
+  #Define minimum gap between the two possible break dates.
+  #the gap is 2 in the crash case and 3 periods in the case of a break model
+  gap <- 2 + as.numeric(model == "break")
+  
+  
+  myBreaks <- matrix(NA, nrow = n - 2 * pnnobs, ncol =  breaks)
+  if(breaks == 1){
+    myBreaks [,1] <- myBreakStart:myBreakEnd
+  } else if (breaks == 2){
+    myBreaks[, 1:breaks] <- cbind(myBreakStart:myBreakEnd,(myBreakStart:myBreakEnd)+gap)
+  }
+  #Define the variables to hold the minimum t-stat
+  tstat <- NA
+  mint <- 1000
+  tstat.result.matrix <- matrix(NA, nrow = n, ncol = n )
+  
+  #Create lists to store the results
+  #Lists for the one break case
+  result.reg.coef <- list()
+  result.reg <- list()
+  result.reg.resid <- list()
+  result.matrix <- list()
+  
+  #Function to analyze the optimal lags to remove autocorrelation from the residuals
+  #Lag selection with general to specific procedure based on Ng,Perron (1995)
+  #ToDo make it possible, that zero lags are included
+  myLagSelection <- function(y.diff, S.tilde, datmat, pmax, Dummy.diff){
+    n <- length(y.diff)
+    
+    #               General to specific approach to determine the lag which removes autocorrelation from the residuals
+    #               Ng, Perron 1995
+    qlag <- pmax
+    while (qlag >= 0) {
+      
+      #               Define optimal lags to include to remove autocorrelation from the residuals
+      #               select p.value of the highest lag order and check if significant
+      #test.coef <- coef(summary(lm(y.diff ~ 0 + lagmatrix(S.tilde,1)[,-1] + datmat[,-1][, 1:(qlag + 1)]  + Dummy.diff)))
+      
+      #lm.fit implementation
+      test.reg.data <- na.omit(cbind(y.diff,lagmatrix(S.tilde,1)[,-1], datmat[,-1][, 1:(qlag + 1)], Dummy.diff))
+      
+      test.reg.lm. <-(lm.fit(x = test.reg.data[,-1], y = test.reg.data[, 1]))
+      
+      df.lm.fit <- length(test.reg.data[,1]) - test.reg.lm.$qr$rank
+      sigma2 <- sum((test.reg.data[,1] - test.reg.lm.$fitted.values)^2)/df.lm.fit
+      varbeta <- sigma2 * chol2inv(qr.R(test.reg.lm.$qr), size = ncol(test.reg.data) -2)
+      SE <- sqrt(diag(varbeta))
+      tstat <- na.omit(coef(test.reg.lm.))/SE
+      pvalue <- 2* pt(abs(tstat), df = df.lm.fit, lower.tail =  FALSE)
+      
+      #                print(test.coef)
+      #                print(paste("lm result:",qlag,test.coef[qlag + 1 , 4]))
+      #                print(paste("lm.fit:",qlag,pvalue[qlag+1]))
+      #               print(c("Number of qlag",qlag)) 
+      if(pvalue[qlag+1] <= 0.1){
+        slag <- qlag
+        #                  print("break")
+        break
+      }
+      qlag <- qlag - 1
+      slag <- qlag
+      
+    }
+    #            print(slag)
+    return(slag)
+  }
+  
+  # Function to calculate the test statistic and make the code shorter, because the function can be used in both cases for 
+  # the one break as well as the two break case
+  myLSfunc <- function(Dt, DTt, y.diff, est.function = c("estimation","results")){
+    
+    Dt.diff <- diffmatrix(Dt, max.diff = 1, max.lag = 1)
+    
+    DTt.diff <- diffmatrix(DTt, max.diff = 1, max.lag = 1)
+    
+    S.tilde <- 0
+    S.tilde <- c(0, cumsum(lm.fit(x = na.omit(cbind(Dt.diff[,])), y=na.omit(y.diff))$residuals))
+    S.tilde.diff <-  diffmatrix(S.tilde,max.diff = 1, max.lag = 1)
+    #       Define optimal lags to include to remove autocorrelation
+    #       max lag length pmax to include is based on Schwert (1989) 
+    pmax <- min(round((12*(n/100)^0.25)),lags)
+    
+    #      Create matrix of lagged values of S.tilde.diff from 0 to pmax
+    #      and check if there is autocorrelation if all these lags are included and iterate down to 1          
+    datmat <- matrix(NA,n, pmax + 2)
+    datmat[ , 1] <- S.tilde.diff
+    #      Add column of 0 to allow the easy inclusion of no lags into the test estimation
+    datmat[ , 2] <- rep(0, n)
+    
+    if(pmax > 0){
+      datmat[, 3:(pmax + 2) ] <- lagmatrix(S.tilde.diff, pmax)[,-1]
+      colnames(datmat) <- c("S.tilde.diff", "NoLags",  paste("S.tilde.diff.l",1:pmax, sep = ""))
+    } else if(lags == 0){
+      colnames(datmat) <- c("S.tilde.diff", "NoLags")
+    }
+    
+    
+    if(method == "Fixed"){
+      slag <- lags
+    } else if(method == "GTOS"){
+      
+      slag <- NA
+      
+      if(model == "crash"){
+        slag <- myLagSelection(y.diff, S.tilde, datmat, pmax, Dt.diff)
+        
+      } else if(model == "break"){
+        slag <- myLagSelection(y.diff, S.tilde, datmat, pmax, DTt.diff)
+      }
+    }
+    
+    S.tilde <- NA
+    
+    
+    
+    if(model == "crash"){
+      S.tilde <- c(0, cumsum(lm.fit(x = na.omit(cbind(Dt.diff[,])), y=na.omit(y.diff))$residuals))
+      S.tilde.diff <-  diffmatrix(S.tilde,max.diff = 1, max.lag = 1)
+      
+      #Add lag of S.tilde.diff to control for autocorrelation in the residuals
+      if(est.function == "results"){
+        break.reg <- summary(lm(y.diff ~ 0 + lagmatrix(S.tilde, 1)[,-1] + datmat[,2:(slag+2)]  + Dt.diff))
+      } else if (est.function == "estimation"){
+        #lm.fit() implementation
+        roll.reg.data <- na.omit(cbind(y.diff, lagmatrix(S.tilde,1)[,-1], datmat[,2:(slag+2)], Dt.diff))
+        
+        roll.reg.lm. <- lm.fit(x = roll.reg.data[,-1], y = roll.reg.data[, 1])
+        
+        
+        df.lm.fit <- length(roll.reg.data[, 1]) - roll.reg.lm.$qr$rank
+        sigma2 <- sum((roll.reg.data[, 1] - roll.reg.lm.$fitted.values)^2)/df.lm.fit
+        varbeta <- sigma2*chol2inv(qr.R(roll.reg.lm.$qr), size = ncol(roll.reg.data) - 2)
+        SE <- sqrt(diag(varbeta))
+        tstat.lm.fit <- na.omit(coef(roll.reg.lm.))/SE
+        pvalue <- 2 * pt(abs(tstat.lm.fit),df = df.lm.fit, lower.tail =  FALSE)
+        coef.roll.reg.lm <- cbind(na.omit(coef(roll.reg.lm.)), SE, tstat.lm.fit, pvalue)
+        
+        tstat.lm.fit <- tstat.lm.fit[1] 
+        
+        # tstat.lm <- coef(break.reg)[1,3]
+        return(coef.roll.reg.lm)
+      }
+      
+      # print(paste("lm.fit", tstat.lm.fit[1]))
+      # print(paste("lm", tstat.lm))
+      #print(roll.reg)
+      if(est.function == "estimation"){
+        return(coef.roll.reg.lm)
+      } else if(est.function == "results"){
+        return(break.reg)
+      }
+      
+    } else if(model =="break"){
+      S.tilde <- c(0, cumsum(lm.fit(x = na.omit(cbind(DTt.diff[,])), y=na.omit(y.diff))$residuals))
+      S.tilde.diff <-  diff(S.tilde)
+      
+      
+      #Add lag of S.tilde.diff to control for autocorrelation in the residuals
+      if(est.function == "results"){
+        break.reg <- summary(lm(y.diff ~ 0 + lagmatrix(S.tilde,1)[,-1] + datmat[,2:(slag+2)] + DTt.diff))
+      } else if (est.function == "estimation"){
+        #lm.fit() implementation
+        roll.reg.data <- na.omit(cbind(y.diff, lagmatrix(S.tilde,1)[,-1], datmat[,2:(slag+2)], DTt.diff))
+        
+        roll.reg.lm. <- lm.fit(x = roll.reg.data[,-1], y = roll.reg.data[, 1])
+        
+        df.lm.fit <- length(roll.reg.data[, 1]) - roll.reg.lm.$qr$rank
+        sigma2 <- sum((roll.reg.data[, 1] - roll.reg.lm.$fitted.values)^2)/df.lm.fit
+        varbeta <- sigma2*chol2inv(qr.R(roll.reg.lm.$qr), size = ncol(roll.reg.data) -2)
+        SE <- sqrt(diag(varbeta))
+        tstat.lm.fit <- na.omit(coef(roll.reg.lm.))/SE
+        pvalue <- 2 * pt(abs(tstat.lm.fit),df = df.lm.fit, lower.tail =  FALSE)
+        coef.roll.reg.lm <- cbind(na.omit(coef(roll.reg.lm.)), SE, tstat.lm.fit, pvalue)
+        
+        tstat.lm.fit <- tstat.lm.fit[1] 
+        return(coef.roll.reg.lm)
+        # tstat.lm <- coef(break.reg)[1,3]
+      }
+      #Return Value
+      #print(roll.reg)
+      #print(paste("lm.fit", tstat.lm.fit))
+      #print(paste("lm", tstat.lm))
+      #print("break")
+      if(est.function == "estimation"){
+        return(coef.roll.reg.lm)
+      } else if(est.function == "results"){
+        return(break.reg)
+      }
+      
+    }
+    
+    #   print(roll.reg)
+    if(est.function == "estimation"){
+      return(coef.roll.reg.lm)
+    } else if(est.function == "results"){
+      return(break.reg)
+    }
+    
+  }
+  
+  
+  # Start of the actual function call
+  
+  if(breaks == 1)
+  {
+    # Function to calculate the rolling t-stat
+    # One Break Case
+    # foreach implementation returns a list of the tstat and the corresponding break dates
+    # 
+    tstat.result.matrix <-  foreach(myBreak1 = myBreaks[,1], .combine = 'rbind') %dopar%{
+      #Dummies for one break case
+      Dt1 <-  as.matrix(cbind(trend, trend >= (myBreak1 + 1)))
+      
+      #       Dummy with break in intercept and in trend
+      DTt1 <- as.matrix(cbind(Dt1, c(rep(0, myBreak1), 1:(n - myBreak1))))
+      colnames(Dt1) <- c("Trend","D")
+      colnames(DTt1) <- c("Trend","D","DTt")
+      #print(paste("Break1: ",myBreak1, sep = ""))
+      
+      #Combine all Dummies into one big matrix to make it easier to include in the regressions
+      
+      Dt <- cbind(Dt1)
+      DTt <- cbind(DTt1)
+      
+      result.reg[[myBreak1]] <- myLSfunc(Dt, DTt, y.diff, est.function = c("estimation"))
+      
+      
+      # return the t.statistic for the considered break dates 
+      tstat <- result.reg[[myBreak1]][1,3]
+      tstat.result <- list(tstat,myBreak1)
+      
+    }#End of first for loop
+  } else if(breaks == 2) {
+    
+    
+    ## Two Break Case
+    # Nested foreach loop to implement the parallelization for the two break case
+    # Returns a complete list with tstat and the corresponding break dates
+    # These returned matrix is then searched for the minimum tstat
+    tstat.result.matrix <- foreach(myBreak1 = myBreaks[,1], .combine = 'rbind', .errorhandling = 'remove') %:%
+      foreach(myBreak2 = myBreaks[which(myBreaks[,2] < myBreakEnd & myBreaks[,2] >= myBreak1 + gap),2]
+              ,.combine = 'rbind', .errorhandling = 'remove') %dopar%{
+                #Dummies for one break case
+                Dt1 <-  as.matrix(cbind(trend, trend >= (myBreak1 + 1)))
+                
+                #       Dummy with break in intercept and in trend
+                DTt1 <- as.matrix(cbind(Dt1, c(rep(0, myBreak1), 1:(n - myBreak1))))
+                colnames(Dt1) <- c("Trend","D")
+                colnames(DTt1) <- c("Trend","D","DTt")
+                #print(paste("Break1: ",myBreak1, sep = ""))
+                
+                #Dummies for two break case
+                Dt2 <-  as.matrix(trend >= (myBreak2 + 1))
+                DTt2 <- as.matrix(cbind(Dt2, c(rep(0, myBreak2), 1:(n - myBreak2))))
+                colnames(Dt2) <- c("D2")
+                colnames(DTt2) <- c("D2","DTt2")
+                #print(paste("Break2: ",myBreak2, sep = ""))
+                
+                #Combine all Dummies into one big matrix to make it easier to include in the regressions
+                
+                Dt <- cbind(Dt1, Dt2)
+                DTt <- cbind(DTt1, DTt2)
+                
+                result.reg <- myLSfunc(Dt, DTt, y.diff, est.function = c("estimation"))
+                
+                
+                # return the t.statistic for the considered break dates 
+                tstat <- result.reg[1,3]
+                tstat.result <- list(tstat,myBreak1,myBreak2) 
+                
+                
+              }#End of nested foreach loops
+    
+  } else if(breaks > 2){
+    
+    print("Currently more than two possible structural breaks are not implemented.")
+  }
+  #Find index of minimum in the result matrix
+  #Determine the breakpoints according to the minimum
+  if(breaks== 2){
+    mybestbreak1 <- as.integer(tstat.result.matrix[which.min(tstat.result.matrix),][2])
+    mybestbreak2 <- as.integer(tstat.result.matrix[which.min(tstat.result.matrix),][3])
+  } else if(breaks == 1){
+    mybestbreak1 <- as.integer(tstat.result.matrix[which.min(tstat.result.matrix),][2])
+  }
+  #Find minimum tstat
+  mint <- tstat.result.matrix[which.min(tstat.result.matrix),][1]
+  #Estimate regression results, based on the determined breaks and the selected lag 
+  # to obtain all necessary information
+  Dt1 <-  as.matrix(cbind(trend, trend >= (mybestbreak1 + 1)))
+  
+  #       Dummy with break in intercept and in trend
+  DTt1 <- as.matrix(cbind(Dt1, c(rep(0, mybestbreak1), 1:(n - mybestbreak1))))
+  colnames(Dt1) <- c("Trend","D")
+  colnames(DTt1) <- c("Trend","D","DTt")
+  #print(paste("Break1: ",myBreak1, sep = ""))
+  
+  if(breaks == 2){
+    #Dummies for two break case
+    Dt2 <-  as.matrix(trend >= (mybestbreak2 + 1))
+    DTt2 <- as.matrix(cbind(Dt2, c(rep(0, mybestbreak2), 1:(n - mybestbreak2))))
+    colnames(Dt2) <- c("D2")
+    colnames(DTt2) <- c("D2","DTt2")
+    #print(paste("Break2: ",myBreak2, sep = ""))
+    
+    #Combine all Dummies into one big matrix to make it easier to include in the regressions
+    
+    Dt <- cbind(Dt1, Dt2)
+    DTt <- cbind(DTt1, DTt2)
+  } else if (breaks == 1){
+    Dt <- Dt1
+    DTt <- DTt1
+    
+  }
+  
+  
+  break.reg <- myLSfunc(Dt, DTt, y.diff, est.function = c("results")) 
+  
+  endtime <- Sys.time()
+  myruntime <- difftime(endtime,starttime, units = "mins")
+  if(print.results == "print"){
+  print(mint)
+  print(paste("First possible structural break at position:", mybestbreak1))
+  print(paste("The location of the first break - lambda_1:", round(mybestbreak1/n, digits = 1),", with the number of total observations:", n))  
+  if(breaks == 2){
+    print(paste("Second possible structural break at position:", mybestbreak2))
+    print(paste("The location of the second break - lambda_2:", round(mybestbreak2/n, digits = 1),", with the number of total observations:", n))  
+    
+    
+    # Output Critical Values    
+    cat("Critical values:\n")
+    print(model.two.break.tau.cval)
+    
+  }else if(breaks == 1){
+    if(model == "crash"){
+      cat("Critical values - Crash model:\n")
+      print(model.one.crash.cval)
+    } else if(model == "break"){
+      cat("Critical values - Break model:\n")
+      print(model.one.break.cval)
+    }
+    
+  }
+  
+  if(method == "Fixed"){
+    print(paste("Number of lags used:",lags))
+  } else if(method == "GTOS"){
+    print(paste("Number of lags determined by general-to-specific lag selection:" 
+                ,as.integer(substring(unlist(attr(delete.response(terms(break.reg)), "dataClasses")[3]),9))-1))
+  } 
+  cat("Runtime:\n")
+  print(myruntime)
+  }
+  # Create complete list with all the information and not only print it
+  if(breaks == 2){
+    results.return <- list(mint, mybestbreak1, mybestbreak2, myruntime)
+    names(results.return) <- c("t-stat", "First break", "Second break", "Runtime")
+  } else if(breaks == 1){
+    results.return <- list(mint, mybestbreak1, myruntime)
+    names(results.return) <- c("t-stat", "First break", "Runtime")
+  }
+  return(list(results.return, break.reg))
+  }#End of ur.ls function
+
+```
+
+Je ne peux pas faire le test de LS avec 2 chocs, mon ordinateur tourne en boucle sans donner de résultats. Nous autorisons ce choc dans l'intercept comme nous l'avons défini avec Zivot et Andrews. Dans le code cela se répercute au travers du paramètre "model ='crash'". 
+
+Avec 
+\begin{equation}
+H_{0} : 1 \ racine \ unitaire \ avec \ changement \ structurel \ à \ 1 \ date \ possible. (\#eq:LSH0)
+\end{equation}
+Contre
+\begin{equation}
+H_{a} : \ TS \ avec \ changement \ structurel (\#eq:LSH1)
+\end{equation}
+
+```{r}
+ur.ls(rte, model = "crash",breaks=1, lags=schwert-1, method = "GTOS", pn=0.1,print.results = "print")
+```
+
+Le dernier coefficient associé à un lag significatif est en position 22. En sélectionnant les t-values supérieures à 1.6 en valeur absolue tous les coefficients associés aux lags sont significatifs sauf le 21eme.
+Le tau calculé vaut -3.643 et le tau simulé vaut -3.566. -3.643 < -3.566, alors on rejette l'hypothèse nulle de présence de racine unitaire sans changement structurel. Choc potentiel en position 155, le 9 août 2010.  
+
+On va procéder au même test de LS mais en autorisant 2 chocs dans notre série.
+
+```{r}
+ur.ls(rte, model = "crash", breaks=2, lags=schwert-1, method = "GTOS", pn=0.1,print.results = "print")
+```
+
+Nous retenons ce modèle avec le coefficient associé au 21ème lag significatif. Dans cette spécification, les coefficients associés aux lags 1 à 14 et 21 sont significatifs d'après leurs t-values respectives supérieures en valeur absolue à 1,6. La statistique calculée du test vaut -4,45. Elle est à comparer avec la statistique tabulée pour un risque de 5% de -5,59. Comme notre statistique calculée est supérieure à la statistique tabulée, nous sommes enclin à ne pas rejeter l'hypothèse nulle de présence de racine unitaire avec changements structurels aux dates 171 et 206, soit le 31 août 2010 et le 19 octobre 2010. On retrouve une proximité entre les deux dates mais aussi une proximité avec celle établie au test précédant n'autorisant qu'un seul choc. Nos deux tests LS montrent une cohérence dans la localisation d'un potentiel choc structurel vers le 3ème trimestre de 2010. Dans un soucis de précaution, je préfère me baser sur les résultat du test avec un seul choc. Les 2 chocs étant très proche pour l'amplitude de la série, j'ai peur que celà biaise la valeur de la statistique calculée et donc le résultat sur la stationnarité.
+
+On conclut à la stationnarité de notre série.  
+\begin{equation}
+rte \sim I(0) (\#eq:rteStatio)
+\end{equation}
+
+# Modèle économétrique
+
+Afin de ne pas contrarier la théorie, on intègre le graphique de l'eacf bien que son utilité  me reste incomprise au vu de la complexité des données réelles...  
+
+```{r}
+eacf(rte)
+```
+
+## Choix du potentiel PGD
+
+```{r}
+reg <- stats::arima(rte, order = c(4,0,4), fixed= c(NA,0,NA,NA,NA,0,NA,NA,NA), transform.pars = FALSE)
+coeftest(reg)
+```
+
+Les coefficients associés sont significatifs au seuil de 5% avec leurs p-values inférieures à 0.05.  
+La valeur estimée de la moyenne est très proche de l'espérance que nous avons calculé avec rbar.
+\begin{equation}
+rte_t= 0.00062969 + 0.34951092rte_{t-1} - 0.44898586rte_{t-3} + 0.79171326rte_{t-4} -0.36751117\epsilon_{t-1} \\ + 0.45636305\epsilon_{t-3} -0.84522474\epsilon_{t-4} (\#eq:eqModele)
+\end{equation}
+
+## Vérification des aléas
+
+### Espérance des aléas
+
+On réalise le test d'espérance nulle des aléas de la régression définie avant. Soit l'hypothèse nulle : 
+\begin{equation}
+H_0 : E[\epsilon] = 0 (\#eq:EaleaH0)
+\end{equation}
+contre l'hypothèse alternative : 
+\begin{equation}
+H_a : E[\epsilon] \not= 0 (\#eq:EaleaH1)
+\end{equation}
+
+```{r}
+residu <- reg$res
+t.test(residu)
+```
+La p-value est supérieure à 5%. L'espérance conditionnelle des résidus est nulle.
+
+### Test d'autocorrélation
+
+On vérifie si les aléas ne sont pas autocorrélés.
+
+```{r}
+residuv=(residu-mean(residu))/sd(residu)
+K <- 22
+tmp<-rep(0,K)
+
+for(i in 1:K){
+tmp[i]<-Box.test(residuv,lag=i,type="Ljung-Box")$p.value
+}
+tmp
+```
+Toutes les p-values sont supérieures à 0.05. Il n'y a pas d'autocorrélation des résidus.
+
+# Clusters de volatilité
+
+On vérifie pour finir l'hypothèse d'homoscédasticité conditionnelles des résidus. Si oui, nous pourrons dire que les résidus sont des bruits blancs.
+
+\begin{equation}
+H_0 : \alpha_1 = \alpha_2 = ... = \alpha_m = 0 (\#eq:VolatH0)
+\end{equation}
+\begin{equation}
+H_1 : au\ moins\ un \ \alpha_i \not= 0 \ ,\  avec\ i \not= 0 (\#eq:VolatH1)
+\end{equation}
+
+```{r}
+LM <- rep(0,22)
+for (i in 1:22){
+  LM[[i]] = ArchTest(as.numeric(rte),lags=i)$p.value
+}
+LM
+```
+
+Les p-values sont toutes inférieures à 0.05. On rejette l'hypothèse nulle d'homoscédasticité conditionnelle. Il y a donc des clusters de volatilité dans le logarithme des rendements.
+
+```{r}
+BIC(reg)
+```
+
+Le BIC de ce modèle vaut -8968,324.
+
+# Queues épaisses conditionnelles
+
+On va devoir prendre en compte l'hétéroscédasticité conditionnelle dans les données tout en gardant une distribution leptokurtique.  
+On définit notre modèle garch(1,1) de la sorte :
+\begin{equation}
+\sigma^2_t = \alpha_0 + \alpha_1 \epsilon^2_{t-1} + \beta_1 \sigma^2_{t-1} (\#eq:Gengle)
+\end{equation}
+On va vérifier que l'on a bien pris en compte toute l'hétéroscédasticité conditionnelle au travers d'un test d'Engle sur les résidus du garch \@ref(eq:Gengle).
+
+```{r}
+volat <- garch(residuv,order = c(1,1))
+summary(volat)
+
+H <- rep(0,K)
+for(i in 1:K){
+  H[[i]] = ArchTest(volat$residuals,lags = i)$p.value
+}
+H
+anscombe.test(volat$residuals)
+```
+
+Les p-values des 3 coefficients associés sont inférieures à 0.05. Les coefficients sont significatifs. De surcroît toutes les p-values de notre Archtest sur les aléas des résidus du modèle ARMA(4,4) sont supérieures à 0.05 donc il y a présence d'homoscédasticité conditionnelle.
+Notre ARMA(4,4) couplé à un GARCH(1,1) modélise l'autocorrélation et l'hétéroscédasticité conditionnelle présente dans les rendements logarithmiques.
+La p-value est inférieure à 0.05 du test d'Anscombe-Glynn. Les queues de distribution des aléas de notre modèle ARMA-GARCH sont plus épaisses que celles d'une loi normale, ceci dû au coefficient de Kurtosis = 5.3175. Pour comparer cette valeur avec le coefficient de Kurtosis de rte (5.4912), il est inférieur. Les clusters de volatilité on été pris en compte et enlevés dans le test d'Anscombe. Il y aura moins de valeur extrêmes avec ce modèle.
+
+# Effet de levier
+
+```{r, fig.cap="Logarithme de l'indice journalier et écart type récursif journalier des rendements"}
+sig <- rep(0,1534)
+for(t in 1:1534){
+  sig[t] <- sqrt(sum(rte[t-22]-(sum(rte[rt-22]/22)))^2/22)
+}
+sigma=sig[24:1534]*100
+plot(log(pt[24:length(1534)]), type='l' ,col="#CC0033", axes=F, xlab="", ylab="")
+axis(2,at=seq(3.25,3.34,by=0.01), col = "#CC0033")
+par(new=T)
+plot(sigma, col=1,type='l',axes = F,xlab="", ylab="")
+axis(4,at=seq(0,3.25,by=0.15))
+legend("topleft", c("log(pt)","sigma"),col = c(2, 1),lty=c(1,1))
+axis(1,at=seq(0,1534,by=250))
+title("Peut-on tirer profit d'une bonne ou mauvaise nouvelle ?")
+```
+
+2 pics pour l'écart type pour une valeur max de 2.25 vers 30% de la période. Le logarithme du prix est croissant jusqu'à 2/3 de la durée de la période, puis il décroit progressivement. Pour retomber à sa valeur initiale à 3.26. L'écart type semble fluctuer autour de 0.9. Il y a une dizaine de pics où l'écart type qui tend vers 0. Il y a donc des périodes très courtes où la volatilité est quasi-nulle. La plus grande volatilité correspond à une hausse, vers la date 500, dû à une bonne nouvelle. Néanmoins, cela n'est pas en lien avec la plus forte hausse. Ce modèle Garch ne modélise pas bien l'effet de levier. Il s'agira d'en trouver plus pertinent dans le prochain projet.
+
+# Annexe
+
+## Robustness check
+
+Dans cette partie nous allons reprendre des tests réalisés auparavant mais en utilisant 1 seul lag significatif comme déterminé par par le critère BIC.
+
+### Zivot et Andrews
+
+Les hypothèses sont les mêmes, \@ref(eq:ZAeq),\@ref(eq:ZAH0),\@ref(eq:ZAH1)
+
+```{r}
+summary(ur.za(rte,model='both',lag=1))
+```
+
+Nous utilisons cette fois un modèle avec un choc conjoncturel et structurel car les coefficients associés à du et dt sont significatif (<5%). Le lag n'est toujours pas significatif car sa t-value inférieure à 1,6. La statistique test vaut -28.49 et la statistique tabulée vaut -5.08 pour le seuil de 5%. Comme la statistique calculée est inférieure à la statistique tabulée, on n'acceptons pas $H_0$ la présence de racine unitaire sans changement structurel. Le choc potentiel est à la position 26, le 5 février 2010. On conclut à la stationnarité ici encore.
+
+### Lee et Strazicich
+
+Selon les hypothèses \@ref(eq:LSH0) et \@ref(eq:LSH1)
+
+```{r}
+ur.ls(rte, model = "crash",breaks=1, lags=1, method = "GTOS", pn=0.1,print.results = "print")
+```
+
+Notre unique lag a un coefficient significatif, il vaut -7,39 et est donc supérieur en sa valeur absolue à 1,6. La statistique calculée vaut -20,15, ce qui est inférieur à la statistique tabulée pour un risque de 5% qui vaut -3,566. On rejette l'hypothèse nulle de présence de racine unitaire sans changement structurel. Le choc est déterminé à la position 819, le 13 mars 2013. Ce test montre une nouvelle fois la stabilité de notre série.
+
+## Comparaison rte - rtt
+
+```{r include=FALSE}
+data <- matrix(0,15,2)
+rownames(data)<-c("Skewness","Kurtosis","Ljung-Box","DF","MAIC","BIC","ADF","ZA","LS","Modèle","Espérance conditionnelle","Autocorrélation des résidus","Homoscédasticité conditionnelle","Modélisation de l'hétéroscédasticité","BIC")
+colnames(data)<-c("rte","rtt")
+data[1,1]=0.15163
+data[2,1]=5.4912
+data[3,1]="absence d'autocorrélation"
+data[4,1]="autocorrélation des aléas"
+data[5,1]="0 lag et drift"
+data[6,1]="1 lag et drift"
+data[7,1]="drift, stationnaire et 21ème lag significatif"
+data[8,1]="intercept, stationnaire et 22ème lag significatif"
+data[9,1]="crash, stationnaire et 22ème lag significatif"
+data[10,1]="ARMA(4,4) sans AR(2) et MA(2)"
+data[11,1]="Nulle"
+data[12,1]="Absence"
+data[13,1]="Rejet"
+data[14,1]="garch(1,1)"
+data[15,1]=-8968.324
+data[1,2]="non significatif"
+data[2,2]=8.1224
+data[3,2]="absence d'autocorrélation"
+data[4,2]="autocorrélation des aléas"
+data[5,2]="2 lags et none et stationnaire"
+data[6,2]="1 lag et none"
+data[7,2]="none, stationnaire et 19ème lag significatif"
+data[8,2]="intercept, stationnaire et 20ème lag significatif"
+data[9,2]="crash, non stationnaire et 17ème lag significatif"
+data[10,2]="ARMA(1,1) sans moyenne"
+data[11,2]="Nulle"
+data[12,2]="Absence"
+data[13,2]="Rejet"
+data[14,2]="garch(1,1)"
+data[15,2]=-5954.42
+```
+
+```{r spoil}
+kable(data,caption = "Récapitulatif de l'analyse sur rte et comparaison avec rtt") %>%
+  kable_styling(bootstrap_options = c("striped", "hover","condensed"),position = "float_right")%>%
+  row_spec(c(3:4,8,11:14), bold = F,color = "green") %>%
+  row_spec(c(2,6:7,10), bold = F,color = "orange") %>%
+  row_spec(c(1,5,9), bold = F,color = "red") %>%
+  pack_rows("Statistiques des données", 1, 3, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Estimation d'un PGD", 10, 15, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Tests de racine unitaire", 4, 9, label_row_css = "background-color: #666; color: #fff;") 
+```
+<p style="color:green"> correspondance</p><p style="color:orange">Correspondance moyenne</p><p style="color:red">Mauvaise correspondance</p>  
+Le BIC n'est pas comparable.  
+Rapidement j'aimerai dire un petit mot sur les différences sur les tests de racine unitaire. Il y a des différences notables sur le nombre de lags significatifs, le type de modèle utilisé et aussi la non stationnarité avec le test de Lee et Strazicich pour rtt. Cela me rend un peu sceptique sur l'efficacité du backtesting pour le prochain projet. J'avais élicité dans le premier graphique (\@ref(fig:hist)) un changement dans la tendance du cours et dans sa fluctuation à partir de 2016. Or, c'est de cette façon que l'on a découpé notre série selon rte (avant 2016) et rtt (après 2016). Est-ce que l'on va pouvoir retrouver à partir de notre PGD estimé par rte cet accroissement de la valorisation boursière ?
+
+## Provenance des résultats sur rtt
+
+```{r}
+agostino.test(rtt)
+```
+```{r}
+anscombe.test(rtt)
+```
+```{r}
+pvaluesrtt =rep(0,20)
+pvaluesrtt2 =rep(0,20)
+for (i in 1:25 ) {
+pvaluesrtt[i] = Box.test(rtt,lag=i,type="Ljung-Box")$p.value
+pvaluesrtt2[i] = Box.test(rtt^2,lag=i,type="Ljung-Box")$p.value
+}
+pvaluesrtt2
+pvaluesrtt
+```
+```{r}
+summary(ur.df(rtt,type='none',lags=0))
+plot(ur.df(rtt,lag=0,type='none'))
+```
+```{r}
+schwert2 <- as.integer(12*(length(rtt)/100)^0.25)
+summary(CADFtest(rtt,criterion="MAIC",type="none",max.lag.y=schwert2))
+summary(ur.df(rtt,type='none',lags=2))
+```
+```{r}
+summary(ur.df(rtt,type='none',selectlags = "BIC"))
+```
+```{r}
+summary(ur.df(rtt,type='none',lags=schwert2-2))
+```
+```{r}
+summary(ur.za(rtt, model='intercept', lag = schwert2-1))
+```
+```{r}
+ur.ls(rtt, model = "crash",breaks=1, lags=17, method = "GTOS", pn=0.1,print.results = "print")
+```
+```{r}
+eacf(rtt)
+reg2 <- stats::arima(rtt, order = c(1,0,1),include.mean = FALSE)
+coeftest(reg2)
+residu2 <- reg2$res
+t.test(residu2)
+residuv2=(residu2-mean(residu2))/sd(residu2)
+K <- 22
+tmp2<-rep(0,K)
+for(i in 1:K){
+tmp2[i]<-Box.test(residuv2,lag=i,type="Ljung-Box")$p.value
+}
+tmp2
+LM2 <- rep(0,22)
+for (i in 1:22){
+  LM2[[i]] = ArchTest(as.numeric(rtt),lags=i)$p.value
+}
+LM2
+```
+```{r}
+volat2 <- garch(residuv2,order = c(1,1))
+summary(volat2)
+H2 <- rep(0,K)
+for(i in 1:K){
+  H2[[i]] = ArchTest(volat2$residuals,lags = i)$p.value
+}
+H2
+anscombe.test(volat2$residuals)
+```
+```{r}
+BIC(reg2)
+```
+

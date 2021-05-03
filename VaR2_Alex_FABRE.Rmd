@@ -1,0 +1,698 @@
+---
+title: "Value at Risk avec l'action ORPEA"
+author: "Alex FABRE"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  bookdown::html_document2:
+    theme: paper
+    highlight: tango
+    toc: true
+    toc_depth: 4
+    toc_float: 
+      collapse: true
+    number_sections: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.align = "center",
+	fig.retina = 2,
+	fig.width = 10,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	cache.lazy = FALSE
+)
+```
+
+```{r packages,}
+library(QuantTools) 
+library(xts)
+library(forecast) 
+library(moments)
+library(BatchGetSymbols)
+library(knitr)
+library(rugarch)
+library(ghyp)
+library(SkewHyperbolic)
+library(PerformanceAnalytics)
+library(parallel)
+library(zoo)
+library(ggplot2)
+```
+
+# Axe principal d'étude
+
+Ce projet suit un premier où l'on avait couplé un modèle ARMA(4,4) sans AR2 et MA2 avec un GARCH(1,1). Nous avions établi une faiblesse quand à la prise en compte d'effet de levier dans les rendements de l'action Orpea. Il s'agira ici de mettre en lumière cet effet au travers d'un modèle GARCH plus élaboré. Des raccourcis ou des idées que nous allons utiliser dans ce travail pourront faire référence à ce premier projet. Vous pourrez vous y référer [ici](https://drive.google.com/file/d/1Txs-Dh8fAsC_Od53aQfzJsO2WFI8EpxH/view?usp=sharing). Nous apprécierons pour finir le backtesting du modèle retenu et le calcul de la Value at Risk.
+
+## Visualisation de l'asymétrie
+
+```{r données,}
+first.date <- "2009-12-31"
+last.date <- "2019-12-31"
+freq.data <- 'daily'
+type.return <- 'log'
+tickers <- 'ORP.PA'
+tab <- BatchGetSymbols(tickers = tickers, 
+                       first.date = first.date,
+                       last.date = last.date, 
+                       freq.data = freq.data,
+                       type.return=type.return,
+                       cache.folder = file.path(tempdir(), 
+                                                'BGS_Cache') ) 
+kable(head(tab$df.tickers), caption="Les 6 premières lignes de données")
+pt<-tab$df.tickers$price.adjusted
+dates<-tab$df.tickers$ref.date[-1]
+rendement=tab$df.tickers$ret.adjusted.prices[-1]
+N<-length(rendement)
+rt<-xts(x=rendement,order.by=dates)
+rte=rendement[1:1534]
+rtt=rendement[1535:N]
+jour=format(dates, format = "%A")
+mois=format(dates, format = "%B")
+moisrte=mois[1:N]
+mai=as.integer(moisrte=="mai")
+jourrte=jour[1:N]
+lundi=as.integer(jourrte=="lundi")
+```
+
+Dans un premier temps, il convient de s'intéresser à la leptokurticité remarquée lors du premier projet. 
+
+```{r QQ asymétrie,}
+qqnorm(rte)
+qqline(rte,col=2)
+```
+
+Les queues de distribution sont effectivement plus épaisses qu'une loi normale. On constate qu'il y a une sur-représentation de rendements très faibles et très élevés. Il n'est pas aisé de distinguer lequel des deux effets est le plus représenté. Il nous faudra prendre en compte cette sur-représentation des extrêmes dans la modélisation.  
+
+Nous allons commencer par représenter les densités des rendements sur rte suivant différentes lois statistiques afin de nous aiguiller pour la recherche d'un modèle. Par ordre d'apparition, ce sera une distribution gaussienne, student asymétrique, nig, hyperbolique et hyperbolique généralisée.
+
+```{r Choix distribution,}
+fitn <- fit.gaussuv(data = rte)
+fitstu <- fit.tuv(rte,silent=T)
+fitnig <- fit.NIGuv(data = rte,silent=T)
+fithyp<- fit.hypuv(rte,silent=T)
+fitghypuv <- fit.ghypuv(rte,silent=T)
+```
+
+
+```{r, fig.cap="Densités selon les distributions"}
+plot(density(rte), main="")
+lines(fitstu,col=2)
+lines(fitnig,col=3)
+lines(fithyp,col=4)
+lines(fitghypuv,col=5)
+title(main = "Densités sur rte")
+legend("topright",legend =c("rte","student","nig","hyp","ghyp"), col =1:5,lty=rep(1,5))
+```
+
+La distribution de student asymétrique prend le plus en compte les valeurs extrêmes mais sous représente les valeurs proche de la moyenne. En revanche la distribution hyperbolique généralisée modélise pertinemment les valeurs moyennes mais est moins performante dans les extrêmes. Ces quatre distributions ne semblent pas adaptées pour nos données. On commencera par tester des modèles suivants d'autres distributions.  
+
+Nous pouvons tester la distribution généralisée hyperbolique asymétrique, cela compensera peut être le manque de prise en compte des valeurs extrêmes cité juste avant.
+
+```{r, fig.cap="Distribution ghyp asymétrique sur rte"}
+ghstfit<-skewhypFit(rte, print = FALSE, plot =FALSE, hessian = TRUE)
+op <- par(mfrow = c(1,2))
+plot(ghstfit, which = 1)
+plot(ghstfit, which = 3)
+```
+```{r eval=FALSE, include=FALSE}
+par(op)
+```
+
+La prise en compte de la leptokurticité est nettement mieux réalisée. Le graphique en Q-Q plot reflète néanmoins une faiblesse pour les valeurs les plus extrêmes positives. Il pourra être intéressant d'utiliser cette distribution dans notre recherche de modèle.
+
+## Modèle retenu
+
+Voici une présentation du meilleur modèle trouvé et de toutes les déclinaisons dans la famille GARCH que nous avons vu en cours. Ce modèle suit une distribution des erreurs généralisées asymétrique. Cette distribution, tout comme celle de student, modélise la leptokurticité. L'analyse débute avec la spécification apARCH qui est la plus complexe étudiée. Nous irons par la suite en décrémentant la complexité du modèle, jusqu'à retourner au modèle GARCH.  
+
+La base du modèle est un ARMA(1,1) :
+\begin{equation}
+rte_t = \Phi_0 + \Phi_1rte_{t-1} + \Theta_1\epsilon_{t-1} + (ce \ que \ l'on \ va \ chercher)
+(\#eq:ARMA)
+\end{equation}
+
+### apARCH(1,1)
+
+Soit le modèle apARCH(1,1) suivant : 
+\begin{equation}  
+r_t = \mu + v_t \\
+v_t = \sigma_t \epsilon_t \\
+\sigma_t^\delta = \alpha_0 + \alpha_1 (|v_{t-1}| - \gamma_1 v_{t-1})^\delta + \beta_1 \sigma_{t-1}^\delta
+(\#eq:apARCH)
+\end{equation}
+
+```{r sged-apARCH,}
+spec_sged_ap = ugarchspec(variance.model=list(model="apARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(lundi,mai))),distribution.model="sged")
+fit_sged_ap = ugarchfit(spec = spec_sged_ap,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_ap)
+```
+
+Première chose à regarder dans ces nombreux résultats est le dernier test, celui ajusté de Pearson. Il défini en effet si la distribution suivie par notre modèle est statistiquement représentative \@ref(eq:Pearson). Les quatre p-values valent entre 0.4323 et 0.8839. Nous optons pour un risque de première espèce de 5%. De ce fait, comme toutes les p-values sont supérieures au seuil de 5%, cette distribution convient. Ensuite nous regardons les coefficients AR1 et MA1. On se place dans le tableau "Robust Standard Errors". Leurs p-values sont inférieures au seuil de 5%, leurs coefficients associés sont dès lors statistiquement significatifs. On constate la même chose pour les variables skew et shape qui représentent l'asymétrie et les queues de distribution. Les p-values respectives sont inférieures à 0,05 les coefficients associés sont statistiquement significatifs. La prochaine variable à étudier est delta. Sa p-value vaut 0,0865, elle est donc supérieure au seuil de 5%. Le coefficient associé n'est pas significatif. De surcroît, cette variable delta a un sens dans notre étude économique que si elle est proche de 1 (l'écart type conditionnel) ou 2 (la variance conditionnelle). C'est en effet la puissance adossée à sigma dans l'équation sous jacente du modèle \@ref(eq:apARCH). Nous avons de ce fait deux conclusions à éliciter. Dans un premier temps, comme le coefficient associé n'est pas statistiquement significatif, nous n'allons pas garder ce modèle apARCH. Deuxièmement, bien qu'au seuil de 5% le coefficient associé à delta n'est pas significatif il l'est pour un seuil de 8,7% ce qui n'est pas très éloigné. On peut alors conjecturer qu'il est plus proche de valoir 3 que 2, nous n'allons dès lors pas utiliser un modèle GJR-GARCH. Ce dernier établissant la variance conditionnelle (delta = 2). Il s'agit maintenant de commenter les variables indicatrices que nous avons rajoutés (mxreg1 et mxreg2). La première modélise un effet le lundi et la deuxième un effet en Mars. Le lundi est un effet connu sur les marchés reflétant la reprise de la semaine de travail, il est cohérent d'essayer de le modéliser. En revanche, nous établissons un effet Mai suite à une conclusion tirée lors du précédent projet. Les deux effets sont significatifs car leurs p-values sont supérieures au seuil de 5%. Dans le tableau Nyblom stability Tests la statistique jointe vaut ~460, la statistique tabulée vaut 2,75. Comme la statistique calculée est supérieure à la statistique tabulée, on rejette l'hypothèse nulle \@ref(eq:NyblomJoint). Tous les coefficients ne sont pas stables dans le temps. Précisément, ce sont omega et mxreg2 qui ont respectivement une valeur calculée individuelle de 63,34 et 0,5 supérieure à la valeur tabulée du test de 0,47. On rejette l'hypothèse \@ref(eq:NyblomIndi), les deux coefficients ne sont pas stables dans le temps. Il faudrait effectuer un changement de régime, ce qui n'est pas compris dans ce cours. La dernière variable à étudier dans ce tableau est gamma. Elle représente la prise en compte d'un effet levier dans nos rendements. Nous validons cet effet suite à la p-value égale à 0,015 qui est de ce fait inférieure au seuil de 5%. Voyons quel type d'effet levier est modélisé. Le résultat se situe dans le tableau 'Sign Bias Test'. Si la probabilité correspondante à l'effet en ligne est supérieure à 0,05 alors il est pris en compte par notre modèle. Dans notre cas ils le sont tous. c'est à dire que nous prenons en compte un effet conjoint signe et taille (Joint effect) \@ref(eq:SignJoint), le signe de l'effet (Sign Bias) \@ref(eq:SignBias), qu'il soit positif (Positive Sign Bias) ou négatif (Negative Sign Bias) \@ref(eq:SignNouP). Pour les tests de LB \@ref(eq:QLBH0) et LM \@ref(eq:Engle) toutes les p-values sont supérieures à 0,05 donc nous acceptons l'hypothèse d'absence d'autocorrélation et d'absence d'effet Arch.  
+
+Cet apARCH ne convient pas, nous allons spécifier un eGARCH où la variable delta ne fait plus partie du modèle.
+
+### eGARCH(1,1)
+
+Ce modèle présenté par Nelson en 1991 s'intéresse aux évolutions asymétriques de la variance. C'est à dire que l'hétéroscédasticité est potentiellement différente selon que l'erreur précédente soit positive ou négative. Ce modèle eGARCH(1,1) est établit de la sorte :
+\begin{equation}
+v_t = \sigma_t \epsilon_t \\
+ln\sigma_t^2 = \alpha_0 + \alpha_1{|\epsilon_{t-1}|+\gamma_1\epsilon_{t-1}\over\sigma_{t-1}}+\beta_1ln(\sigma_{t-1}^2)
+(\#eq:eGARCH)
+\end{equation}
+
+```{r sged-eGARCH}
+spec_sged_eg = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(mai))),distribution.model="sged")
+fit_sged_eg= ugarchfit(spec = spec_sged_eg,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_eg)
+```
+
+La distribution est cohérente suite aux p-values du test de Pearson supérieures à 0,05 \@ref(eq:Pearson). Les coefficients associés à AR1, Ma1, skew, shape, gamma1, beta1, alpha1 et omega sont inférieurs au seuil de risque de première espèce et donc ils sont statistiquement significatifs. Une étape n'est pas montré ici, j'ai testé comme le cas eGARCH un effet lundi et Mai. Le coefficient associé à lundi n'était pas significatif (p-value inférieure à 5%) donc je l'ai retiré. En revanche, notre effet Mai reste présent suite à la p-value de 0,73. On constate que les tests LB, LM ont toutes leurs p-values supérieures à 0,05. Le statistique calculée du test de Nyblom (1,75) est inférieure à la statistique tabulée pour un risque de 5% (2,32). Suite à cela, on accepte l'hypothèse nulle d'asence d'autocorrélation \@ref(eq:QLBH0), on accepte l'hypothèse nulle d'asence d'effet Arch \@ref(eq:Engle), on accepte l'hypothèse nulle de stabilité des coefficients dans le temps \@ref(eq:NyblomJoint). Maintenant vient à commenter la partie décisive de ce modèle, c'est à dire les effets de levier. Tout d'abord, les quatre probabilités du tableau Sign Bias Test sont supérieures à 0,05 \@ref(eq:SignJoint) \@ref(eq:SignBias) \@ref(eq:SignNouP). Les effets taille et signe sont alors pris en compte dans la modélisation. De surcroît le coefficient estimé de gamma est positif et celui de alpha est négatif. Le SBIC vaut -5,96 \@ref(eq:Bayes).  
+
+Ce modèle répond à tous les critères attendus, ce sera celui retenu. Il convient de faire une critique sur la t-value du paramètre beta1, elle est très élevée (~137). Il est probablement judicieux de manipuler ce paramètre avec plus de précautions qu'habituellement.
+
+```{r, fig.cap="Impact des nouvelles dans le modèle eGARCH"}
+niegarch=newsimpact(z=NULL, fit_sged_eg)
+plot(niegarch$zx,niegarch$zy, xlab=niegarch$xexpr,ylab=niegarch$yexpr ,type="l")
+```
+
+Ce graphique permet de mettre en lumière l'hétéroscédasticité suivant si l'erreur précédante était positive ou négative. On constate que les cas négatifs ont un impact plus important sur la volatilité que ceux positifs. Une mauvaise nouvelle se répercute de manière plus prononcée sur le cours de l'action Orpea qu'une bonne nouvelle.  
+
+Avant de passer au calcul de la VaR et au backtesting. Nous allons commenter de façon plus sommaire les déclinaisons restantes comme il l'était demandé pour ce travail. En dehors du contexte nous ne l'aurions pas fait. Si vous souhaitez aller directement au résultat de la VaR et du backtesting (\@ref(tab:spoil)).
+
+### iGARCH(1,1)
+
+Ce modèle fixe alpha1 et beta1 = 1 de la sorte que alpha1 est estimé puis beta1 est déduit. Cela se traduit par un modèle iGARCH suivant :
+\begin{equation}
+v_t = \sigma_t \epsilon_t \\
+\sigma_t^2 = \alpha_0 + \beta_1\sigma_{t-1}^2 + (1-\beta_1)v_{t-1}^2 \\
+où \ 0 < \beta1 < 1 \ et \ \alpha_1 + \beta_1 = 1
+(\#eq:iGARCH)
+\end{equation}
+
+```{r sged-iGARCH}
+spec_sged_ig = ugarchspec(variance.model=list(model="iGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(mai))),distribution.model="sged")
+fit_sged_ig= ugarchfit(spec = spec_sged_ig,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_ig)
+```
+
+Dans le test de Pearson une des p-values n'est pas supérieure à 0,05. La distribution ne modélise pas assez bien le modèle. Les tests d'effet de signe, de taille et de stabilité des coefficients dans le temps ne sont pas concluants. Les résultats des paramètres Ar1, Ma1, skew, shape, alpha1 et mxreg1 sont bons. Notons tout de mêmes les fortes t-values pour Ar1 et Ma1. Beta n'est pas estimé ce qui explique les "NA" car il est fixé. Ce modèle peut être acceptable car le coefficient associé à alpha1 est significatif.
+
+### ARCHM(1,1)
+
+Notre modèle ARCHM s'exprime comme suit :
+\begin{equation}
+r_t = \mu + c\sigma_t^2 + v_t \ \ \ où \ c \ est \ la \ prime \ de \ risque \\
+v_t = \sigma_t\epsilon_t \\
+\sigma^2_t = \alpha_0 + \alpha_1v_{t-1}^2+\beta_1\sigma_{t-1}^2
+(\#eq:ARCHM)
+\end{equation}
+
+```{r}
+spec_sged_am = ugarchspec(mean.model=list(armaOrder=c(1,1),archm=TRUE,external.regressors=as.matrix(cbind(mai))),distribution.model="sged")
+fit_sged_am = ugarchfit(spec = spec_sged_am,data = rt,out.sample=length(rtt),solver="hybrid")
+fit_sged_am
+```
+
+En ce qui concerne les tests de Pearson, sur les signes, LM, LB, Nyblom tout est ok. Les coefficients associés aux paramètres sont tous significatifs sauf omega. Ceci est aussi ok. Le paramètre ARCHM correspond au c dans \@ref(eq:ARCHM). Il est estimé à -0,34. c'est à dire que le rendement diminue avec l'augmentation de la volatilité. Résultat étrange, logiquement le rendement est une fonction croissante de la volatilité. Il n'y a pas de raison à priori de rejeter ce modèle si nous n'avions pas mieux.
+
+### GARCH(1,1)
+
+Soit un GARCH(1,1) : 
+\begin{equation}
+v_t = \sigma_t\epsilon_t \\
+\sigma_t^2 = \alpha_0 + \alpha_1v_{t-1}^2 + \beta_1\sigma_{t-1}^2 \\
+avec \ \alpha_1 \ge 0, \ \beta_1 \le 1 \ et \ \alpha_1 + \beta_1 < 1
+(\#eq:GARCH)
+\end{equation}
+
+```{r}
+spec_sged_garch = ugarchspec(distribution.model="sged")
+fit_sged_garch = ugarchfit(spec = spec_sged_garch, data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_garch)
+```
+
+Le coefficient associé à alpha1 n'est pas significatif au seuil de 5%. Ce modèle n'est pas valide pour nos données.   
+
+## Prévisions
+
+```{r}
+prev = ugarchforecast(fit_sged_eg, n.ahead=length(rtt),n.roll=length(rtt))
+op <- par(mfrow = c(1,2))
+plot(prev,which=2)
+plot(prev,which=4)
+```
+```{r eval=FALSE, include=FALSE}
+par(op)
+```
+
+Ces deux graphiques illustrent la prévision conditionnelle de la variance sur rtt. On remarque avec celui de droite que la courbe rouge des prévisions suit les hausses mais ne mesure pas assez les amplitudes. 
+
+### Estimation par fenêtre glissante
+
+```{r Fiche4, fig.cap="Comparaison de la VaR estimée par fenêtre glissante"}
+no_cores <- parallel::detectCores() - 1
+cl <- makeCluster(no_cores)
+spec_sged_eg = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(mai))),distribution.model="sged")
+roll=ugarchroll(spec_sged_eg, data=rt,n.ahead=1,forecast.length=length(rtt),refit.every=1,
+      refit.window="moving",solver = "hybrid", cluster=cl,fit.control = list(),calculate.VaR=TRUE,VaR.alpha=0.05,keep.coef = TRUE)
+stopCluster(cl)
+valueatrisk<-zoo(roll@forecast$VaR[,1])
+reelles<-zoo(roll@forecast$VaR[,2])
+index<-rownames(roll@forecast$VaR)
+plot(dates[1535:N],reelles,type='b',xlab="Dates",ylab="Rendements et VaR")
+lines(dates[1535:N],valueatrisk,type='l',col="red")
+legend("topright",inset=.05,c("rtt","VaR"),col=1:2,lty=c(1,1))
+```
+
+Ce graphique permet de donner une vision d'ensemble sur la VaR estimée à chaque période comparée à la valeur effective de cette même période. Un espace un peu plus chahuté autour de 2019 semble se dessiner. On peut observer de multiples dépassements de la VaR. Au contraire l'année 2017 subit un unique dépassement en fin d'année. Un étude chiffrée nous donnera l'occasion de préciser les violations de la VaR.
+
+### Estimation unique
+
+```{r}
+fit = ugarchfit(spec_sged_eg, data = rte)
+spec2 = spec_sged_eg
+setfixed(spec2)<-as.list(coef(fit))
+filt = ugarchfilter(spec=spec2, data=rtt)
+filt
+```
+
+Au regard des p-values, nous pouvons constater la validation de chaque test. Les critères sont les mêmes que ceux explicités lors du modèle apARCH et eGARCH.
+
+```{r,fig.cap="Comparaison de la VaR estimée de manière figée"}
+VaR=fitted(filt)+sigma(filt)*qdist("sged",p=0.05,mu=0,sigma=1,
+    skew = coef(filt)["skew"],shape=coef(filt)["shape"])
+matplot(cbind(VaR,rtt),type="l",col=c("red","black"),ylab="Rendements et VaR")
+```
+
+On distingue tout comme avant un nombre plus important de dépassements de la VaR aux alentours de l'année 2019, période 750 sur le graphique.
+
+## Backtesting
+
+Nous allons effectuer le backtesting de la VaR selon le test de LR de Kupiec et LR de Christoffersen. Puis nous utiliserons le test d'ES de McNeil et Frey qui permet d'établir l'ampleur de la perte en cas de violations.
+
+### Kupiec et Christoffersen
+
+Ce test se représente suivant l'équation : 
+\begin{equation}
+LR = -2log{q^N(1-q)^{T-N} \over \hat{f}^N(1-\hat{f})^{T-N}} \\
+où \ N \ est \ le \ nombre \ de \ violations \ de \ la \ vaR, \ T \ le \ nombre \ d'observations \ initiales, \\ et \ q \ le \ taux \ de \ violations \ théoriques 
+(\#eq:LRKupiec)
+\end{equation}
+
+Sous $H_0$ f est le vrai taux de violation \@ref(eq:Chris), $L \sim \chi^2(1)$.
+
+```{r}
+report(roll,type="VaR",VaR.alpha=0.05,conf.level=0.95)
+```
+
+Pour le test de Christoffersen, la p-value du test vaut 0,121. Elle est donc inférieure au seuil de 5%. Nous sommes enclin à ne pas accepter $H_0$ \@ref(eq:Chris). La VaR n'est pas correctement estimée. Notre backtesting reflète une sur-estimation de la VaR. En effet, nous dépassons la valeur prévue 4,1% du temps ce qui est inférieur au seuil de 5%. Le modèle pousse à être trop conservateur vis-à-vis du risque cible.  
+
+Pour aller plus loin, nous allons calculer l'Expected Shortfall qui est une mesure cohérente du risque comparé à la VaR qui ne l'est pas.
+
+### Expected Shortfall
+
+Cette mesure ne fait pas partie des accords de Bâle du fait qu'il n'existe pas de méthode appropriée pour le backtesting. Nous pouvons anticiper une potentielle application future et s'entraîner dans sa compréhension. Sous les hypothèses :
+\begin{equation}
+H_0 : expected \ shortfall \ correctement \ estimée \\
+H_1 : expected \ shortfall \ sous \ estimée
+(\#eq:ES)
+\end{equation}
+
+```{r}
+f = function(x){
+    qdist("sged",p=x,mu=0,sigma=1,skew=coef(filt)["skew"],shape=coef(filt)["shape"]) }
+ES = fitted(filt) + sigma(filt)*integrate(f, 0, 0.05)$value/0.05
+print(ESTest(0.05, rtt, ES, VaR, boot = TRUE))
+```
+
+La p-value du test est de 0,088. Elle est supérieure au seuil de 5%. Nous sommes enclin à ne pas accepter l'hypothèse nulle \@ref(eq:ES). La moyenne de toutes les pertes maximales dans les 38 cas où nous dépassons la VaR est correctement estimée. Notons aussi que nous estimons cette fois encore moins de dépassement qu'attendu, 38 et non 51.
+
+Passons désormais au calcul de value at risk suivant différentes méthodes.
+
+## VaR
+
+Voyons ce que donne l'estimation de la VaR sur rte avec notre modèle ARMA(1,1) - eGARCH(1,1).
+
+```{r, fig.cap="VaR estimée d'un modèle ARMA(1,1) - eGARCH(1,1)"}
+VaR95<- as.numeric(quantile(fit_sged_eg, probs =0.05))
+plot(VaR95, type='l',col=1)
+```
+
+On observe 2 pics aux alentours de la 450 et 500 dates pour une valeur de -0,038%. Pour se situer cela correspond au dernier trimestre de 2011. En dehors de cette période, la VaR au seuil de 95% varie entre une perte maximal de -0,03% et 0,015%.
+
+```{r VaR normale}
+VaR(rte, p=.95, method="gaussian")
+```
+```{r VaR Cornish Fisher}
+VaR(rte, p=.95, method="modified")
+```
+```{r VaR Historique}
+VaR(rte, p=.95, method="historical")
+```
+```{r VaR Kernel}
+-VaR(rte, p=.95, method="kernel",weights = 1,portfolio_method="component")$contribution
+```
+
+Afin de ne pas être redondant, nous allons commenter la première valeur de VaR. Pour la méthode gaussienne, elle vaut -0,02044. La perte maximale potentielle à 1 jour pour un risque de 5% est de 2,044% de la valeur investie. L'interprétation est identique pour les trois autres méthodes. Si nous devions définir le montant de fonds propre à détenir, cette méthode serait la plus restrictive car elle envisage la perte la plus élevée comparée aux trois autres, toutes choses égales par ailleurs.  
+
+Pour retrouver une VaR normale à 10 jours il convient d'effectuer ce calcul.
+
+```{r}
+-0.02044211 * sqrt(10)
+```
+
+On a 5% de risque de subir une perte plus grande que -6,464% de la valeur investie à 10 jours.
+
+Nous allons par la suite comparer ces 4 méthodes de VaR sur l'ensemble de rtt.
+
+```{r, fig.cap="Comparaison des VaR selon les méthodes"}
+Ne=length(rte)
+Nt=length(rtt)
+alpha=0.95
+backTestVaR <- function(x, p = alpha) {
+  normal.VaR = as.numeric(VaR(x, p=p, method="gaussian"))
+  historical.VaR = as.numeric(VaR(x, p=p, method="historical"))
+  modified.VaR = as.numeric(VaR(x, p=p, method="modified"))
+  kernel.VaR = VaR(x,p=p,method="kernel",weights = 1,portfolio_method="component")$contribution * (-1)
+  ans = c(normal.VaR, historical.VaR, modified.VaR, kernel.VaR)
+  names(ans) = c("Normale", "Historique", "Modifiée","Kernel")
+  return(ans)
+}
+VaR.results = rollapply(as.zoo(rt), width=Ne, 
+                        FUN = backTestVaR, p=alpha, by.column = FALSE,
+                        align = "right")
+chart.TimeSeries(merge(rt, VaR.results),legend.loc="bottom")
+```
+
+On retrouve avec le graphique que la VaR normale est celle impliquant les pertes potentielles les plus fortes. Il semble que les trois autres soient confondues. Nous observerons ceci en détail dans la suite.
+
+```{r}
+violations.mat = matrix(0, 4, 5)
+rownames(violations.mat) = c("Normale", "Historique", "Modifiée","Kernel")
+colnames(violations.mat) = c("Nombre de violations théoriques", "Nombre de violations empririques", "Part de violations théoriques",
+                             "Part de violations empiriques", "VR")
+violations.mat[, "Nombre de violations théoriques"] = (1-alpha)*Nt
+violations.mat[, "Part de violations théoriques"] = 1 - alpha
+
+normalVaR.violations = as.numeric(as.zoo(rt[index(VaR.results)])) < VaR.results[, "Normale"]
+violation.dates = index(normalVaR.violations[which(normalVaR.violations)])
+
+for(i in colnames(VaR.results)) {
+  VaR.violations = as.numeric(as.zoo(rt[index(VaR.results)])) < VaR.results[, i]
+  violations.mat[i, "Nombre de violations empririques"] = sum(VaR.violations)
+  violations.mat[i, "Part de violations empiriques"] = sum(VaR.violations)/Nt
+  violations.mat[i, "VR"] = violations.mat[i, "Nombre de violations empririques"]/violations.mat[i, "Nombre de violations théoriques"]
+}
+kable(violations.mat, caption="Dépassement de la VaR sur rtt")
+```
+
+On trouve que l'estimation selon une méthode gaussienne se distingue des trois autres. Elle admet moins de dépassements car la valeur de la VaR est négativement plus forte. Le seuil de VaR est franchi 49 fois, la où il l'est 57 fois pour les 3 autres méthodes. Le seuil de violation est inférieur à 5% pour cette méthode gaussienne, et il est supérieur pour les autres. Pour un risque fixé de 5% est celle qui s'en rapproche le mieux.
+
+```{r}
+resultats<-data.frame(matrix(NA,ncol=4,nrow=4))
+colnames(resultats)<-c("Dépassements théoriques","Dépassements empiriques","Kupiec P-Value","Christoffersen P-Value")
+rownames(resultats)<-c("Normale", "Historique", "Modifiée","Kernel")
+
+# normale
+VaR.test1 = VaRTest(1-alpha,actual=coredata(rt[index(VaR.results)]), VaR=coredata(VaR.results[,"Normale"]))
+resultats[1,1]=VaR.test1$expected.exceed
+resultats[1,2]=VaR.test1$actual.exceed
+resultats[1,3]=VaR.test1$uc.LRp
+resultats[1,4]=VaR.test1$cc.LRp
+
+# historique
+VaR.test2 = VaRTest(1-alpha,actual=coredata(rt[index(VaR.results)]), VaR=coredata(VaR.results[,"Historique"]))
+resultats[2,1]=VaR.test2$expected.exceed
+resultats[2,2]=VaR.test2$actual.exceed
+resultats[2,3]=VaR.test2$uc.LRp
+resultats[2,4]=VaR.test2$cc.LRp
+
+# modifiée
+VaR.test3 = VaRTest(1-alpha, actual=coredata(rt[index(VaR.results)]), VaR=coredata(VaR.results[,"Modifiée"]))
+
+resultats[3,1]=VaR.test3$expected.exceed
+resultats[3,2]=VaR.test3$actual.exceed
+resultats[3,3]=VaR.test3$uc.LRp
+resultats[3,4]=VaR.test3$cc.LRp
+
+# Kernel
+VaR.test4 = VaRTest(1-alpha, actual=coredata(rt[index(VaR.results)]), VaR=coredata(VaR.results[,"Kernel"]))
+
+resultats[4,1]=VaR.test4$expected.exceed
+resultats[4,2]=VaR.test4$actual.exceed
+resultats[4,3]=VaR.test4$uc.LRp
+resultats[4,4]=VaR.test4$cc.LRp
+
+kable(resultats, caption="Dépassement de la VaR selon Kupiec et Christoffersen")
+```
+
+Pour conclure cette analyse, nous nous intéresserons à la p-value du test de Christoffersen. Pour les quatre tests elle est inférieure à 0,05. Nous sommes alors enclin à ne pas rejeter l'hypothèse nulle \@ref(eq:Chris), le nombre de dépassement est correctement estimé et les dépassements sont statistiquement indépendants.
+
+## Résumé
+
+```{r spoil}
+data <- matrix(0,1,11)
+rownames(data) <- "ARMA(1,1) + eGARCH(1,1)"
+colnames(data) <- c("VaR 1j", "% violations","Kupiec","Christoffersen","VaR 1j", "% violations","Kupiec","Christoffersen",
+                    "LR Kupiec","LR Christoffersen","ES" )
+data[1,1]= -0.02044211
+data[1,5]= -0.01924014
+data[1,2]= 0.0479922
+data[1,6]= 0.0558276
+data[1,3]= 0.7615903
+data[1,7]= 0.4053703
+data[1,4]= 0.0263556
+data[1,8]= 0.0023542
+data[1,9]= 0.181
+data[1,10]= 0.121
+data[1,11]= 0.08845297
+kable(data,caption="Récapitulatif des VaR") %>%
+  kable_styling(bootstrap_options = c("striped", "hover","condensed")) %>%
+  add_header_above(c("Méthode","Normale" = 4,"Cornish Fisher / Historique / Kernel" =4,"Globale"=3)) 
+```
+
+# Annexe
+
+## Répertoire des différents tests
+
+* **Bayes**   
+Critère d'information que l'on cherche à minimiser : 
+\begin{equation}
+SBIC = log\hat{\sigma}_T^2(k)+ {logT \over T}k
+(\#eq:Bayes)
+\end{equation}
+
+* **Test de Ljung-Box**  
+\begin{equation} 
+H_0 : \rho(k) =0, \ \forall k=1, ..., K \\
+H_1 : \rho(k) \not= 0 \ pour \ au \ moins \ un \ k \ de \ 1 \ à \ K 
+(\#eq:LB)
+\end{equation}
+La statistique du test de Ljung box est la suivante : 
+\begin{equation}
+Q_K=N(N+2)\sum_{k=1}^{K} \frac{\hat{\rho}(k)^2}{N-k} 
+(\#eq:QLB)
+\end{equation}
+Donne sous $H_0$,
+\begin{equation}
+\forall k < K, \ Q_K \to _{N\to\infty}^L \chi^2(K) 
+(\#eq:QLBH0)
+\end{equation}
+
+* **Arch Test d'Engle**  
+\begin{equation}
+\sigma^2_t = \alpha_0 + \alpha_1 \epsilon^2_{t-1} + \beta_1 \sigma^2_{t-1} 
+(\#eq:Engle)
+\end{equation}
+
+* **Nyblom stability test**  
+  * Pour la statistique jointe, soit l'hypothèse nulle de stabilité dans le temps : 
+\begin{equation}
+H_0 : Tous \ les \ coefficients \ sont \ stables \ dans \ le \ temps. \\
+H_1 : Au \ moins \ un \ des \ coefficients \ n'est \ pas \ stable \ dans \ le \ temps.
+(\#eq:NyblomJoint)
+\end{equation}
+  * Pour la statistique individuelle, les hypothèses sont :
+\begin{equation}
+H_0 : Le \ coefficient \ est \ stable \ dans \ le \ temps. \\
+H_1 : Le \ coefficient \ n'est \ pas \ stable \ dans \ le \ temps.
+(\#eq:NyblomIndi)
+\end{equation}
+
+* **Sign Bias Test**  
+  * Joint effect :
+\begin{equation}
+H_0 : Absence \ d'effet \ signe \ et \ taille \ d'un \ choc \ sur \ la \ volatilité. \\
+H_1 : Au \ moins \ un \ des \ deux \ effets.
+(\#eq:SignJoint)
+\end{equation}
+  * Sign Bias :
+\begin{equation}
+H_0 : Absence \ de \ différences \ d'un \ choc \ positif \ ou \ négatif \ sur \ la \ volatilité. \\
+H_1 : Au \ moins \ un \ des \ deux \ effets.
+(\#eq:SignBias)
+\end{equation}
+  * Negative (positive) Sign Bias :
+\begin{equation}
+H_0 : Abscence \ d'effet \ taille \ d'un \ choc \ négatif \ (positif). \\
+H_1 : Présence \ d'effet \ taille \ d'un \ choc \ négatif \ (positif).
+(\#eq:SignNouP)
+\end{equation}
+
+* **Adjusted Pearson Goodness-of-Fit Test** 
+\begin{equation}
+H_0 : Adéquation \ entre \ la \ distribution \ du \ test \ et \ la \ distribution \ réelle. \\
+H_1 : Non \ adéquation \ entre \ la \ distribution \ du \ test \ et \ la \ distribution \ réelle.
+(\#eq:Pearson)
+\end{equation}
+
+* **Test LR de Christoffersen** 
+\begin{equation}
+H_0 : f = q \ et \ indépendance \ des \ dépassements \\
+H_1 : f \ne q \ soit \ dépendance \ dans \ les \ dépassements \ soit \ les \ deux
+(\#eq:Chris)
+\end{equation}
+
+## Exemples de modèles rejetés
+
+Il s'agira d'apprécier différents cas où l'on a dû rejeter des modèles et d'en comprendre les motifs. Apprécions un résumé au travers d'un tableau.
+
+```{r}
+library(readxl)
+library(kableExtra)
+modeles <- read_excel("modeles.xlsx")
+kable(modeles, caption="Extrait de modèles testé") %>%
+  kable_styling(bootstrap_options = c("striped", "hover","condensed")) %>%
+  pack_rows("Modèle retenu",1,5 , label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Distribution ghyp et solver nlnimb", 6, 8, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Distribution sstd", 9, 11, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Distribution sged", 12, 14, label_row_css = "background-color: #666; color: #fff;") %>%
+  pack_rows("Distribution sged et solver gosolnp", 15, 16, label_row_css = "background-color: #666; color: #fff;") %>%
+  row_spec(2, bold = F,color = "green")
+```
+
+
+### Distribution ghyp
+
+```{r ghyp-apARCH}
+spec_ghyp_ap = ugarchspec(variance.model=list(model="apARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(mai))),distribution.model="ghyp")
+fit_ghyp_ap= ugarchfit(spec = spec_ghyp_ap,data = rt,out.sample=length(rtt),solver="nlminb")
+show(fit_ghyp_ap)
+```
+
+Distribution et coefficients ARMA validés. Delta proche de 2 et significatif donc on test un GJR-GARCH.
+
+```{r ghyp-gjrGARCH}
+spec_ghyp_ap = ugarchspec(variance.model=list(model="gjrGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(mai))),distribution.model="ghyp")
+fit_ghyp_ap= ugarchfit(spec = spec_ghyp_ap,data = rt,out.sample=length(rtt),solver="nlminb")
+show(fit_ghyp_ap)
+```
+
+Coefficient associé au Skew non significatif et instabilité dans le temps pour omega, skew, mxreg1 et ma1. On va tester un eGARCH. 
+
+```{r ghyp-eGARCH}
+spec_ghyp_eg = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(1,1),include.mean=T,external.regressors=as.matrix(cbind(mai))),distribution.model="ghyp")
+fit_ghyp_eg= ugarchfit(spec = spec_ghyp_eg,data = rt,out.sample=length(rtt),solver="nlminb")
+show(fit_ghyp_eg)
+```
+
+Les coefficients associés à skew et shape non sont pas significatifs. Ce modèle n'est définitivement pas pertinent.
+
+### Distribution sstd
+
+```{r sstd-apARCH,}
+spec_sstd_ap = ugarchspec(variance.model=list(model="apARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(4,4),include.mean=F),distribution.model="sstd"
+                   , fixed.pars = list(ar2=0,ma2=0))
+fit_sstd_ap= ugarchfit(spec = spec_sstd_ap,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sstd_ap)
+```
+
+Delta non significatif. On passe à un eGARCH.
+
+```{r sstd-eGARCH,}
+spec_sstd_eg = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(4,4),include.mean=T),distribution.model="sstd"
+                   , fixed.pars = list(ar2=0,ma2=0))
+fit_sstd_eg= ugarchfit(spec = spec_sstd_eg,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sstd_eg)
+```
+
+On a rajouté mu car son coefficient est significatif. Deux points apportent une réticence : deux t-values dépassent 100 et 3 paramètres sont instables dans le temps. Voyons si l'on peut obtenir un iGARCH adéquat.
+
+```{r sstd-iGARCH,}
+spec_sstd_ig = ugarchspec(variance.model=list(model="iGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(4,4),include.mean=T),distribution.model="sstd"
+                   , fixed.pars = list(ar2=0,Ma2=0))
+fit_sstd_ig= ugarchfit(spec = spec_sstd_ig,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sstd_ig)
+```
+
+Deux coefficients de notre ARMA ne sont pas significatifs. On ne retiendra pas ce modèle.
+
+### Distribution sged
+
+#### ARMA(2,2)
+
+```{r sged-apARCH2-2,}
+spec_sged_ap2 = ugarchspec(variance.model=list(model="apARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(2,2),include.mean=F),distribution.model="sged")
+fit_sged_ap2= ugarchfit(spec = spec_sged_ap2,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_ap2)
+```
+
+Le coefficient associé à delta n'est pas significatif. Nous allons tester un modèle eGARCH.
+
+```{r sged-eGARCH2-2,}
+spec_sged_eg2 = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(4,2),include.mean=F),distribution.model="sged")
+fit_sged_eg2= ugarchfit(spec = spec_sged_eg2,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_eg2)
+```
+
+Les t-values deviennent abérrantes, il ne semble pas pertinent de poursuivre avec ce modèle.
+
+```{r sged-iGARCH2-2,}
+spec_sged_ig2 = ugarchspec(variance.model=list(model="iGARCH", garchOrder=c(1,1)),
+                                    mean.model=list(armaOrder=c(4,2),include.mean=F),distribution.model="sged")
+fit_sged_ig2= ugarchfit(spec = spec_sged_ig2,data = rt,out.sample=length(rtt),solver="hybrid")
+show(fit_sged_ig2)
+```
+
+Même constat concernant les t-values. Cette dynamique de modélisation est à oublier.
+
+#### ARMA(1,1) solver = "gosolnp"
+
+```{r}
+moisrte=mois[1:1534]
+janvier=as.integer(moisrte=="janvier")
+```
+
+```{r}
+spec_sged_ap3 = ugarchspec(variance.model=list(model="apARCH", garchOrder=c(1,1)),
+                   mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(lundi,janvier))),distribution.model="sged")
+fit_sged_ap3= ugarchfit(spec = spec_sged_ap3,data = rt,out.sample=length(rtt),solver="gosolnp")
+show(fit_sged_ap3)
+```
+
+Le coefficient associé à delta n'est pas significatif. Nous allons tester un modèle eGARCH.
+
+```{r}
+spec_sged_eg3 = ugarchspec(variance.model=list(model="eGARCH", garchOrder=c(1,1)),
+                   mean.model=list(armaOrder=c(1,1),include.mean=F,external.regressors=as.matrix(cbind(lundi,janvier))),distribution.model="sged"
+                   ,fixed.pars=list(mxreg1=0))
+fit_sged_eg3= ugarchfit(spec = spec_sged_eg3,data = rt,out.sample=length(rtt),solver="gosolnp")
+show(fit_sged_eg3)
+```
+
+Ce modèle valide les hypothèses importantes. Cependant on observe des limites suite aux valeurs de trois t-values. Il manque la prise en compte de l'effet du signe du biais.
